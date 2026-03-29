@@ -21,7 +21,7 @@ paimon-python/.idea/
 ### AI Assistants ###
 .claude
 .cursor
-.qoder
+#.qoder
 
 ### Java / Maven ###
 target
