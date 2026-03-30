@@ -46,6 +46,7 @@ from pypaimon.read.reader.row_range_filter_record_reader import RowIdFilterRecor
 from pypaimon.read.reader.format_blob_reader import FormatBlobReader
 from pypaimon.read.reader.format_lance_reader import FormatLanceReader
 from pypaimon.read.reader.format_pyarrow_reader import FormatPyArrowReader
+from pypaimon.read.reader.format_vortex_reader import FormatVortexReader
 from pypaimon.read.reader.iface.record_batch_reader import (RecordBatchReader,
                                                             RowPositionReader, EmptyRecordBatchReader)
 from pypaimon.read.reader.iface.record_reader import RecordReader
@@ -149,6 +150,9 @@ class SplitRead(ABC):
         elif file_format == CoreOptions.FILE_FORMAT_LANCE:
             format_reader = FormatLanceReader(self.table.file_io, file_path, read_file_fields,
                                               read_arrow_predicate, batch_size=batch_size)
+        elif file_format == CoreOptions.FILE_FORMAT_VORTEX:
+            format_reader = FormatVortexReader(self.table.file_io, file_path, read_file_fields,
+                                               read_arrow_predicate, batch_size=batch_size)
         elif file_format == CoreOptions.FILE_FORMAT_PARQUET or file_format == CoreOptions.FILE_FORMAT_ORC:
             name_to_field = {f.name: f for f in self.read_fields}
             ordered_read_fields = [name_to_field[n] for n in read_file_fields if n in name_to_field]
@@ -609,8 +613,13 @@ class DataEvolutionSplitRead(SplitRead):
             elif first_file.write_cols:
                 field_ids = self._get_field_ids_from_write_cols(first_file.write_cols)
             else:
-                # For regular files, get all field IDs from the schema
-                field_ids = [field.id for field in self.table.fields]
+                # For regular files without write_cols, derive field IDs from
+                # the file's schema version, not the current table schema.
+                # The file only contains columns from when it was written.
+                file_schema = self.table.schema_manager.get_schema(first_file.schema_id)
+                field_ids = [field.id for field in file_schema.fields]
+                field_ids.append(SpecialFields.ROW_ID.id)
+                field_ids.append(SpecialFields.SEQUENCE_NUMBER.id)
 
             read_fields = []
             for j, read_field_id in enumerate(read_field_index):

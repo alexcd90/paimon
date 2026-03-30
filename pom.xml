@@ -73,6 +73,8 @@ under the License.
         <module>tools/ci/paimon-ci-tools</module>
         <module>paimon-api</module>
         <module>paimon-lumina</module>
+        <module>paimon-vortex</module>
+        <module>paimon-tantivy</module>
     </modules>
 
     <properties>
@@ -626,6 +628,8 @@ under the License.
                         <exclude>paimon-common/src/main/antlr4/**</exclude>
                         <exclude>paimon-core/src/test/resources/compatibility/**</exclude>
                         <exclude>paimon-python/pypaimon/sample/data/**</exclude>
+                        <exclude>**/*.proto</exclude>
+                        <exclude>**/Cargo*</exclude>
                     </excludes>
                 </configuration>
             </plugin>
