@@ -7,23 +7,46 @@ description: 追踪 Apache Paimon 项目研发进展：拉取最新代码合并�
 
 追踪 Apache Paimon 项目的研发进展，自动拉取最新代码、分析新增 commit、生成结构化 changelog 文件。
 
+## 平台适配说明
+
+AI agent 在执行本技能前，应先根据用户的操作系统信息选择对应的命令语法：
+
+- **macOS / Linux**：使用 bash 语法
+- **Windows**：使用 PowerShell 语法
+
+对于 `git` 原生命令（如 `git remote -v`、`git pull`、`git log`、`git show`、`git add`、`git commit`、`git push` 等），所有平台语法完全一致，无需区分。
+
+对于**变量赋值、时间获取、目录创建、字符串拼接**等操作，不同平台语法存在差异，相关步骤中会同时提供两种写法，agent 应按实际系统选择其一执行。
+
+---
+
 ## 工作流程
 
 ### Step 1：确保 upstream 已配置，记录当前 HEAD，拉取最新代码
 
-```powershell
+```bash
 # 检查是否存在 upstream remote
 git remote -v
 ```
 
 若没有 `upstream`，先添加 Apache 官方仓库：
 
-```powershell
+```bash
 git remote add upstream https://github.com/apache/paimon.git
 ```
 
-然后拉取并合并：
+然后记录当前 HEAD，再拉取并合并：
 
+**macOS / Linux (bash)：**
+```bash
+# 记录拉取前的 HEAD commit
+oldHead=$(git rev-parse HEAD)
+
+# 从 Apache 官方仓库拉取最新代码，冲突以官方为准
+git pull -X theirs upstream master
+```
+
+**Windows (PowerShell)：**
 ```powershell
 # 记录拉取前的 HEAD commit
 $oldHead = git rev-parse HEAD
@@ -36,6 +59,13 @@ git pull -X theirs upstream master
 
 ### Step 2：找出新增的 commit 列表
 
+**macOS / Linux (bash)：**
+```bash
+# 列出 oldHead..HEAD 之间所有新增的 commit（从旧到新排列）
+git log $oldHead..HEAD --oneline --reverse
+```
+
+**Windows (PowerShell)：**
 ```powershell
 # 列出 oldHead..HEAD 之间所有新增的 commit（从旧到新排列）
 git log $oldHead..HEAD --oneline --reverse
@@ -45,9 +75,9 @@ git log $oldHead..HEAD --oneline --reverse
 
 ### Step 3：逐个分析每个 commit
 
-对每个新增 commit，执行：
+对每个新增 commit，执行（所有平台一致）：
 
-```powershell
+```bash
 git show <commit_hash> --stat
 git show <commit_hash>
 ```
@@ -63,15 +93,29 @@ git show <commit_hash>
 文件命名格式：`changelog-{YYYY-MM-DD-HHmm}.md`
 文件存放路径：项目根目录下的 `track/` 文件夹
 
-**必须使用 PowerShell 命令动态获取当前时间生成文件名**，不得手动填写固定日期：
+**必须使用命令动态获取当前时间生成文件名**，不得手动填写固定日期：
 
+**macOS / Linux (bash)：**
+```bash
+projectRoot=$(git rev-parse --show-toplevel)
+now=$(date +"%Y-%m-%d-%H%M")
+filePath="$projectRoot/track/changelog-$now.md"
+
+# 若 track 文件夹不存在，先创建
+mkdir -p "$projectRoot/track"
+```
+
+**Windows (PowerShell)：**
 ```powershell
 $projectRoot = git rev-parse --show-toplevel
 $now = Get-Date -Format "yyyy-MM-dd-HHmm"
 $filePath = "$projectRoot/track/changelog-$now.md"
+
+# 若 track 文件夹不存在，先创建
+New-Item -ItemType Directory -Force -Path "$projectRoot/track"
 ```
 
-- 若 `track` 文件夹不存在，先创建该文件夹，再写入文件
+- 若 `track` 文件夹不存在，对应命令会自动创建，再写入文件
 
 ## changelog 文件模板
 
@@ -116,14 +160,26 @@ $filePath = "$projectRoot/track/changelog-$now.md"
 
 将新生成的 changelog 文件和上游拉取的代码一起提交并推送：
 
-```powershell
-# 添加 changelog 文件
+```bash
+# 添加 changelog 文件（所有平台一致）
 git add track/changelog-*.md
+```
 
-# 提交
+提交时引用前面获取的时间变量：
+
+**macOS / Linux (bash)：**
+```bash
 git commit -m "track: add changelog $now"
+```
 
-# 推送到 origin
+**Windows (PowerShell)：**
+```powershell
+git commit -m "track: add changelog $now"
+```
+
+推送到远程（所有平台一致）：
+
+```bash
 git push origin master
 ```
 
