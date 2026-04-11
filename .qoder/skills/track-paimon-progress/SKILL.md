@@ -154,6 +154,38 @@ New-Item -ItemType Directory -Force -Path "$projectRoot/track"
 | core | N | Feature×a, Fix×b |
 | flink | N | Feature×a |
 | ...  | N | ... |
+
+---
+
+## 本次进展亮点
+
+> 从本次变更中挑选 2-10 个最值得关注的功能/修复，重点说明其使用场景和方式。
+
+### 1. {亮点标题}
+
+{2-3句背景说明，解释此功能解决了什么问题或带来了什么改进}
+
+**使用示例**：
+根据功能类型自由选择最直观的代码语言，优先顺序如下：
+- SQL 操作类→ 优先用 Flink SQL 或 Spark SQL
+- 纯 Java/Scala 内部 API → 用 Java 示例
+- Python 客户端功能 → 用 Python 示例
+- 命令行工具 → 用 Shell 示例
+
+```sql
+-- 示例（可替换为 java/python/bash 代码块）
+```
+
+### 2. {亮点标题}
+
+{2-3句背景说明}
+
+**使用示例**：
+```python
+# 示例代码
+```
+
+...（以此类推，每个亮点必须包含可运行的示例代码）
 ```
 
 ### Step 5：提交并推送到远程仓库
@@ -192,3 +224,8 @@ git push origin master
 - 文件路径引用使用 Markdown 链接格式指向实际文件
 - 若新增 commit 超过 20 个，优先分析功能类（Feature/Fix/Perf）commit，测试和文档类可简略处理
 - changelog 文件创建后，告知用户文件的完整路径
+- **本次进展亮点**章节必须为每个亮点提供可运行的示例代码，代码语言根据功能类型自由选择：SQL 操作类优先 Flink/Spark SQL，纯 Java 内部 API 类使用 Java，Python 客户端功能使用 Python，命令行工具使用 Shell；**示例代码必须严格来源于以下渠道，禁止凭空推断或虚构**：
+  1. commit diff 中新增/修改的代码片段（测试代码中的用法也算）
+  2. commit message 中作者提供的示例
+  3. PR 描述中的用法说明
+  若以上渠道均无法提供准确示例，**只写文字描述，不写代码块**，避免给出错误演示
