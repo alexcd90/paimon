@@ -147,6 +147,9 @@ class FileStoreCommit:
             commit_kind = "OVERWRITE"
             detect_conflicts = True
             allow_rollback = True
+        if self.conflict_detection.has_row_id_check_from_snapshot():
+            detect_conflicts = True
+            allow_rollback = True
 
         self._try_commit(commit_kind=commit_kind,
                          commit_identifier=commit_identifier,
@@ -201,9 +204,7 @@ class FileStoreCommit:
                         f"Partition keys are: {list(self.table.partition_keys)}."
                     )
 
-        # Use full table fields so FullStartingScanner's trim_and_transform_predicate
-        # maps indices correctly (full schema index -> partition index).
-        predicate_builder = PredicateBuilder(self.table.fields)
+        predicate_builder = PredicateBuilder(self.table.partition_keys_fields)
         partition_predicates = []
         for part in partitions:
             sub_predicates = [
@@ -378,6 +379,10 @@ class FileStoreCommit:
                     delta_record_count -= entry.file.row_count
 
             total_record_count += delta_record_count
+            index_manifest = None
+            if latest_snapshot and commit_kind == "APPEND":
+                index_manifest = latest_snapshot.index_manifest
+
             snapshot_data = Snapshot(
                 version=3,
                 id=new_snapshot_id,
@@ -391,6 +396,7 @@ class FileStoreCommit:
                 commit_kind=commit_kind,
                 time_millis=int(time.time() * 1000),
                 next_row_id=next_row_id,
+                index_manifest=index_manifest,
             )
             # Generate partition statistics for the commit
             statistics = self._generate_partition_statistics(commit_entries)
@@ -516,7 +522,7 @@ class FileStoreCommit:
         """Generate commit entries for OVERWRITE mode based on latest snapshot."""
         entries = []
         current_entries = [] if latest_snapshot is None \
-            else (FileScanner(self.table, lambda: [], partition_filter).
+            else (FileScanner(self.table, lambda: ([], None), partition_predicate=partition_filter).
                   read_manifest_entries(self.manifest_list_manager.read_all(latest_snapshot)))
         for entry in current_entries:
             entry.kind = 1  # DELETE

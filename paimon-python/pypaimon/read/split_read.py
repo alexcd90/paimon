@@ -29,7 +29,7 @@ from pypaimon.globalindex import Range
 from pypaimon.manifest.schema.data_file_meta import DataFileMeta
 from pypaimon.read.interval_partition import IntervalPartition, SortedRun
 from pypaimon.read.partition_info import PartitionInfo
-from pypaimon.read.push_down_utils import trim_predicate_by_fields
+from pypaimon.read.push_down_utils import rewrite_predicate_indices, trim_predicate_by_fields
 from pypaimon.read.reader.concat_batch_reader import (ConcatBatchReader,
                                                       MergeAllBatchReader, DataEvolutionMergeReader)
 from pypaimon.read.reader.concat_record_reader import ConcatRecordReader
@@ -105,13 +105,27 @@ class SplitRead(ABC):
             self.read_fields = self._create_key_value_fields(read_type)
         self.schema_id_2_fields = {}
         self.deletion_file_readers = {}
-        # Only apply filter when all predicate columns are in read schema.
-        read_names = {f.name for f in self.read_fields}
-        self.predicate_for_reader = (
-            self.predicate
-            if self.predicate is not None and _get_all_fields(self.predicate).issubset(read_names)
-            else None
-        )
+        # Apply filter only when all predicate columns are read by this scan,
+        # AND remap predicate leaf indices into the row layout the reader sees.
+        # Predicate leaves carry an `index` baked in by PredicateBuilder against
+        # the *original* table schema; if `read_type` is narrower or reordered,
+        # that index no longer matches the OffsetRow handed to
+        # FilterRecordReader (which would otherwise raise IndexError).
+        # We use `read_type` here, not `self.read_fields`: MergeFileSplitRead
+        # augments `read_fields` with _KEY_*/_SEQ/_KIND prefixes, but
+        # KeyValueUnwrapRecordReader returns kv.value whose arity equals
+        # len(read_type) and whose coordinate space is read_type — that is
+        # the space FilterRecordReader actually evaluates against.
+        read_type_names = {f.name for f in read_type}
+        if (
+            self.predicate is not None
+            and _get_all_fields(self.predicate).issubset(read_type_names)
+        ):
+            self.predicate_for_reader = rewrite_predicate_indices(
+                self.predicate, read_type
+            )
+        else:
+            self.predicate_for_reader = None
 
     def _push_down_predicate(self) -> Optional[Predicate]:
         if self.predicate is None:
@@ -130,7 +144,8 @@ class SplitRead(ABC):
 
     def file_reader_supplier(self, file: DataFileMeta, for_merge_read: bool,
                              read_fields: List[str], row_tracking_enabled: bool,
-                             row_ranges=None) -> RecordBatchReader:
+                             row_ranges=None,
+                             row_range: Optional[Tuple[int, int]] = None) -> RecordBatchReader:
         (read_file_fields, read_arrow_predicate) = self._get_fields_and_predicate(file.schema_id, read_fields)
 
         # Use external_path if available, otherwise use file_path
@@ -145,8 +160,8 @@ class SplitRead(ABC):
             effective_row_ranges = Range.and_(row_ranges, [file.row_id_range()])
             if len(effective_row_ranges) == 0:
                 return EmptyRecordBatchReader()
-            if file_format == CoreOptions.FILE_FORMAT_VORTEX:
-                # Convert global row ranges to local indices for Vortex pushdown
+            if file_format in (CoreOptions.FILE_FORMAT_VORTEX, CoreOptions.FILE_FORMAT_LANCE):
+                # Convert global row ranges to local file indices for native pushdown
                 row_indices = []
                 for r in effective_row_ranges:
                     start = r.from_ - file.first_row_id
@@ -163,8 +178,11 @@ class SplitRead(ABC):
                                              self.read_fields, read_arrow_predicate, blob_as_descriptor,
                                              batch_size=batch_size)
         elif file_format == CoreOptions.FILE_FORMAT_LANCE:
-            format_reader = FormatLanceReader(self.table.file_io, file_path, read_file_fields,
-                                              read_arrow_predicate, batch_size=batch_size)
+            name_to_field = {f.name: f for f in self.read_fields}
+            ordered_read_fields = [name_to_field[n] for n in read_file_fields if n in name_to_field]
+            format_reader = FormatLanceReader(self.table.file_io, file_path, ordered_read_fields,
+                                              read_arrow_predicate, batch_size=batch_size,
+                                              row_range=row_range, row_indices=row_indices)
         elif file_format == CoreOptions.FILE_FORMAT_VORTEX:
             name_to_field = {f.name: f for f in self.read_fields}
             ordered_read_fields = [name_to_field[n] for n in read_file_fields if n in name_to_field]
@@ -178,7 +196,8 @@ class SplitRead(ABC):
             ordered_read_fields = [name_to_field[n] for n in read_file_fields if n in name_to_field]
             format_reader = FormatPyArrowReader(
                 self.table.file_io, file_format, file_path,
-                ordered_read_fields, read_arrow_predicate, batch_size=batch_size)
+                ordered_read_fields, read_arrow_predicate, batch_size=batch_size,
+                options=self.table.options)
         elif file_format in ('json', 'csv'):
             raise NotImplementedError(
                 f"Reading '{file_format}' format is not yet supported in Python SDK. "
@@ -416,6 +435,15 @@ class RawFileSplitRead(SplitRead):
             (start_pos, end_pos) = shard_file_idx_map[file.file_name]
             if (start_pos, end_pos) == (-1, -1):
                 return None
+            file_path = file.external_path if file.external_path else file.file_path
+            file_format = format_identifier(os.path.basename(file_path))
+            if file_format == CoreOptions.FILE_FORMAT_LANCE:
+                file_batch_reader = self.file_reader_supplier(
+                    file=file,
+                    for_merge_read=False,
+                    read_fields=read_fields,
+                    row_tracking_enabled=True,
+                    row_range=(start_pos, end_pos))
             else:
                 file_batch_reader = ShardBatchReader(self.file_reader_supplier(
                     file=file,

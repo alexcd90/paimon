@@ -18,6 +18,8 @@
 
 package org.apache.paimon;
 
+import org.apache.paimon.append.dataevolution.DataEvolutionCompactCoordinator;
+import org.apache.paimon.append.dataevolution.DataEvolutionCompactTask;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
@@ -26,11 +28,13 @@ import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.DataFormatTestUtil;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.variant.GenericVariant;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.fs.FileIOFinder;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.globalindex.btree.BTreeGlobalIndexBuilder;
+import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.manifest.IndexManifestEntry;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
@@ -48,9 +52,12 @@ import org.apache.paimon.table.Table;
 import org.apache.paimon.table.sink.BatchTableCommit;
 import org.apache.paimon.table.sink.BatchTableWrite;
 import org.apache.paimon.table.sink.BatchWriteBuilder;
+import org.apache.paimon.table.sink.CommitMessage;
+import org.apache.paimon.table.sink.CommitMessageImpl;
 import org.apache.paimon.table.sink.InnerTableCommit;
 import org.apache.paimon.table.sink.StreamTableCommit;
 import org.apache.paimon.table.sink.StreamTableWrite;
+import org.apache.paimon.table.source.EndOfScanException;
 import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
@@ -935,6 +942,337 @@ public class JavaPyE2ETest {
 
     protected GenericRow createRow3ColsWithKind(RowKind rowKind, Object... values) {
         return GenericRow.ofKind(rowKind, values[0], values[1], values[2]);
+    }
+
+    /** Java writes a VARIANT-column table for Python to read (Java→Python E2E). */
+    @Test
+    @EnabledIfSystemProperty(named = "run.e2e.tests", matches = "true")
+    public void testJavaWriteVariantTable() throws Exception {
+        Identifier identifier = identifier("variant_test");
+        catalog.dropTable(identifier, true);
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("payload", DataTypes.VARIANT())
+                        .option("bucket", "-1")
+                        .build();
+        catalog.createTable(identifier, schema, false);
+
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            write.write(
+                    GenericRow.of(
+                            1,
+                            BinaryString.fromString("Alice"),
+                            GenericVariant.fromJson("{\"age\":30,\"city\":\"Beijing\"}")));
+            write.write(
+                    GenericRow.of(
+                            2,
+                            BinaryString.fromString("Bob"),
+                            GenericVariant.fromJson("{\"age\":25,\"city\":\"Shanghai\"}")));
+            write.write(
+                    GenericRow.of(
+                            3,
+                            BinaryString.fromString("Carol"),
+                            GenericVariant.fromJson("[1,2,3]")));
+            commit.commit(write.prepareCommit());
+        }
+
+        // Verify Java can read back what it wrote
+        FileStoreTable readTable = (FileStoreTable) catalog.getTable(identifier);
+        List<Split> splits = new ArrayList<>(readTable.newSnapshotReader().read().dataSplits());
+        TableRead read = readTable.newRead();
+        List<String> res =
+                getResult(read, splits, row -> internalRowToString(row, readTable.rowType()));
+        assertThat(res).hasSize(3);
+        LOG.info("testJavaWriteVariantTable: wrote and read back {} VARIANT rows", res.size());
+
+        // Also write a shredded VARIANT table for Python to read (variant_shredded_test).
+        // The shredding schema shreds the 'age' (BIGINT) and 'city' (VARCHAR) sub-fields
+        // of the 'payload' column so Python can exercise the shredded-read path.
+        String shreddingJson =
+                "{\"type\":\"ROW\",\"fields\":[{\"name\":\"payload\",\"type\":"
+                        + "{\"type\":\"ROW\",\"fields\":["
+                        + "{\"name\":\"age\",\"type\":\"BIGINT\"},"
+                        + "{\"name\":\"city\",\"type\":\"VARCHAR\"}"
+                        + "]}}]}";
+        Identifier shreddedId = identifier("variant_shredded_test");
+        catalog.dropTable(shreddedId, true);
+        Schema shreddedSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("payload", DataTypes.VARIANT())
+                        .option("bucket", "-1")
+                        .option("parquet.variant.shreddingSchema", shreddingJson)
+                        .build();
+        catalog.createTable(shreddedId, shreddedSchema, false);
+
+        FileStoreTable shreddedTable = (FileStoreTable) catalog.getTable(shreddedId);
+        BatchWriteBuilder shreddedWriteBuilder = shreddedTable.newBatchWriteBuilder();
+        try (BatchTableWrite shreddedWrite = shreddedWriteBuilder.newWrite();
+                BatchTableCommit shreddedCommit = shreddedWriteBuilder.newCommit()) {
+            shreddedWrite.write(
+                    GenericRow.of(
+                            1,
+                            BinaryString.fromString("Alice"),
+                            GenericVariant.fromJson("{\"age\":30,\"city\":\"Beijing\"}")));
+            shreddedWrite.write(
+                    GenericRow.of(
+                            2,
+                            BinaryString.fromString("Bob"),
+                            GenericVariant.fromJson("{\"age\":25,\"city\":\"Shanghai\"}")));
+            shreddedWrite.write(
+                    GenericRow.of(
+                            3,
+                            BinaryString.fromString("Carol"),
+                            GenericVariant.fromJson("[1,2,3]")));
+            shreddedCommit.commit(shreddedWrite.prepareCommit());
+        }
+
+        FileStoreTable shreddedReadTable = (FileStoreTable) catalog.getTable(shreddedId);
+        List<Split> shreddedSplits =
+                new ArrayList<>(shreddedReadTable.newSnapshotReader().read().dataSplits());
+        List<String> shreddedRes =
+                getResult(
+                        shreddedReadTable.newRead(),
+                        shreddedSplits,
+                        row -> internalRowToString(row, shreddedReadTable.rowType()));
+        assertThat(shreddedRes).hasSize(3);
+        LOG.info(
+                "testJavaWriteVariantTable: wrote shredded VARIANT table '{}' with {} rows",
+                shreddedId.getTableName(),
+                shreddedRes.size());
+    }
+
+    /** Java reads a VARIANT-column table written by Python (Python→Java E2E). */
+    @Test
+    @EnabledIfSystemProperty(named = "run.e2e.tests", matches = "true")
+    public void testJavaReadVariantTable() throws Exception {
+        Identifier identifier = identifier("py_variant_test");
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        List<Split> splits = new ArrayList<>(table.newSnapshotReader().read().dataSplits());
+        TableRead read = table.newRead();
+        List<String> res =
+                getResult(read, splits, row -> internalRowToString(row, table.rowType()));
+        assertThat(res).hasSize(4);
+
+        // Verify the VARIANT column is present in the schema
+        assertThat(table.rowType().getFieldNames()).contains("payload");
+        assertThat(table.rowType().getTypeAt(table.rowType().getFieldIndex("payload")))
+                .isEqualTo(DataTypes.VARIANT());
+
+        // Verify each row's VARIANT payload can be decoded by Java
+        List<Split> splits2 = new ArrayList<>(table.newSnapshotReader().read().dataSplits());
+        try (org.apache.paimon.reader.RecordReader<InternalRow> reader =
+                read.createReader(splits2)) {
+            reader.forEachRemaining(
+                    row -> {
+                        int id = row.getInt(0);
+                        if (id == 4) {
+                            // null payload
+                            assertThat(row.isNullAt(2)).isTrue();
+                        } else {
+                            assertThat(row.isNullAt(2)).isFalse();
+                            org.apache.paimon.data.variant.Variant v = row.getVariant(2);
+                            assertThat(v).isNotNull();
+                        }
+                    });
+        }
+        LOG.info(
+                "testJavaReadVariantTable: Java read {} VARIANT rows written by Python",
+                res.size());
+
+        // Also read the shredded VARIANT table written by Python (py_variant_shredded_test).
+        // Python writes with variant.shreddingSchema to produce shredded Parquet; Java must
+        // reassemble the shredded sub-columns back into VARIANT values.
+        Identifier shreddedId = identifier("py_variant_shredded_test");
+        FileStoreTable shreddedTable = (FileStoreTable) catalog.getTable(shreddedId);
+        List<Split> shreddedSplits =
+                new ArrayList<>(shreddedTable.newSnapshotReader().read().dataSplits());
+        TableRead shreddedRead = shreddedTable.newRead();
+        List<String> shreddedRes =
+                getResult(
+                        shreddedRead,
+                        shreddedSplits,
+                        row -> internalRowToString(row, shreddedTable.rowType()));
+        assertThat(shreddedRes).hasSize(3);
+
+        // Schema check: the logical type must still be VARIANT
+        assertThat(shreddedTable.rowType().getFieldNames()).contains("payload");
+        assertThat(
+                        shreddedTable
+                                .rowType()
+                                .getTypeAt(shreddedTable.rowType().getFieldIndex("payload")))
+                .isEqualTo(DataTypes.VARIANT());
+
+        // Verify each row's VARIANT can be decoded
+        List<Split> shreddedSplits2 =
+                new ArrayList<>(shreddedTable.newSnapshotReader().read().dataSplits());
+        try (org.apache.paimon.reader.RecordReader<InternalRow> reader =
+                shreddedRead.createReader(shreddedSplits2)) {
+            reader.forEachRemaining(
+                    row -> {
+                        assertThat(row.isNullAt(2)).isFalse();
+                        org.apache.paimon.data.variant.Variant v = row.getVariant(2);
+                        assertThat(v).isNotNull();
+                    });
+        }
+        LOG.info(
+                "testJavaReadVariantTable: Java read {} shredded VARIANT rows written by Python",
+                shreddedRes.size());
+    }
+
+    /** Step 1: Write 5 base files for compact conflict test. */
+    @Test
+    @EnabledIfSystemProperty(named = "run.e2e.tests", matches = "true")
+    public void testCompactConflictWriteBase() throws Exception {
+        Identifier id = identifier("compact_conflict_test");
+        try {
+            catalog.dropTable(id, true);
+        } catch (Exception ignore) {
+        }
+        Schema schema =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.INT())
+                        .column("f1", DataTypes.STRING())
+                        .column("f2", DataTypes.STRING())
+                        .option(ROW_TRACKING_ENABLED.key(), "true")
+                        .option(DATA_EVOLUTION_ENABLED.key(), "true")
+                        .option(BUCKET.key(), "-1")
+                        .build();
+        catalog.createTable(id, schema, false);
+
+        RowType fullType = schema.rowType().project(Arrays.asList("f0", "f1"));
+
+        for (int fileIdx = 0; fileIdx < 5; fileIdx++) {
+            int startId = fileIdx * 200;
+            FileStoreTable t = (FileStoreTable) catalog.getTable(id);
+            BatchWriteBuilder builder = t.newBatchWriteBuilder();
+            try (BatchTableWrite w = builder.newWrite().withWriteType(fullType)) {
+                for (int i = 0; i < 200; i++) {
+                    w.write(
+                            GenericRow.of(
+                                    startId + i, BinaryString.fromString("n" + (startId + i))));
+                }
+                builder.newCommit().commit(w.prepareCommit());
+            }
+        }
+        LOG.info("compact_conflict_test: 5 base files written (200 rows each, total 1000)");
+    }
+
+    /** Step 3: Run compact on compact_conflict_test table. */
+    @Test
+    @EnabledIfSystemProperty(named = "run.e2e.tests", matches = "true")
+    public void testCompactConflictRunCompact() throws Exception {
+        Identifier id = identifier("compact_conflict_test");
+        doDataEvolutionCompact((FileStoreTable) catalog.getTable(id));
+        LOG.info("compact_conflict_test: compact done, 5 files merged into 1 (1000 rows)");
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "run.e2e.tests", matches = "true")
+    public void testDataEvolutionWrite() throws Exception {
+        for (String format : Arrays.asList("parquet", "orc", "avro")) {
+            Identifier identifier = identifier("data_evolution_test_" + format);
+            catalog.dropTable(identifier, true);
+            Schema schema =
+                    Schema.newBuilder()
+                            .column("f0", DataTypes.INT())
+                            .column("f1", DataTypes.STRING())
+                            .column("f2", DataTypes.STRING())
+                            .option(ROW_TRACKING_ENABLED.key(), "true")
+                            .option(DATA_EVOLUTION_ENABLED.key(), "true")
+                            .option(CoreOptions.FILE_FORMAT.key(), format)
+                            .build();
+            catalog.createTable(identifier, schema, false);
+
+            RowType writeType0 = schema.rowType().project(Arrays.asList("f0", "f1"));
+            RowType writeType1 = schema.rowType().project(Collections.singletonList("f2"));
+
+            FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+            BatchWriteBuilder builder = table.newBatchWriteBuilder();
+
+            // Write (f0, f1) columns
+            try (BatchTableWrite write = builder.newWrite().withWriteType(writeType0)) {
+                for (int i = 0; i < 5; i++) {
+                    write.write(GenericRow.of(i, BinaryString.fromString("a" + i)));
+                }
+                builder.newCommit().commit(write.prepareCommit());
+            }
+
+            // Write (f2) column with setFirstRowId
+            table = (FileStoreTable) catalog.getTable(identifier);
+            long rowId = table.snapshotManager().latestSnapshot().nextRowId() - 5;
+            builder = table.newBatchWriteBuilder();
+            try (BatchTableWrite write = builder.newWrite().withWriteType(writeType1)) {
+                for (int i = 0; i < 5; i++) {
+                    write.write(GenericRow.of(BinaryString.fromString("b" + i)));
+                }
+                List<CommitMessage> messages = write.prepareCommit();
+                setFirstRowId(messages, rowId);
+                builder.newCommit().commit(messages);
+            }
+
+            LOG.info("data_evolution_test_{}: written 5 rows with partial columns", format);
+        }
+    }
+
+    /** Read data evolution tables written by Python. */
+    @Test
+    @EnabledIfSystemProperty(named = "run.e2e.tests", matches = "true")
+    public void testReadDataEvolutionTable() throws Exception {
+        for (String format : Arrays.asList("parquet", "orc", "avro")) {
+            Identifier identifier = identifier("data_evolution_test_py_" + format);
+            FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+            ReadBuilder readBuilder = table.newReadBuilder();
+            List<Split> splits = new ArrayList<>(readBuilder.newScan().plan().splits());
+            TableRead read = readBuilder.newRead();
+            List<String> res =
+                    getResult(
+                            read,
+                            splits,
+                            row -> DataFormatTestUtil.toStringNoRowKind(row, table.rowType()));
+            assertThat(res).hasSize(5);
+            LOG.info("data_evolution_test_py_{}: read {} rows", format, res.size());
+        }
+    }
+
+    private void setFirstRowId(List<CommitMessage> messages, long firstRowId) {
+        messages.forEach(
+                c -> {
+                    CommitMessageImpl impl = (CommitMessageImpl) c;
+                    List<DataFileMeta> newFiles =
+                            new ArrayList<>(impl.newFilesIncrement().newFiles());
+                    impl.newFilesIncrement().newFiles().clear();
+                    impl.newFilesIncrement()
+                            .newFiles()
+                            .addAll(
+                                    newFiles.stream()
+                                            .map(f -> f.assignFirstRowId(firstRowId))
+                                            .collect(Collectors.toList()));
+                });
+    }
+
+    private void doDataEvolutionCompact(FileStoreTable table) throws Exception {
+        DataEvolutionCompactCoordinator coordinator =
+                new DataEvolutionCompactCoordinator(table, false, false);
+        List<CommitMessage> messages = new ArrayList<>();
+        try {
+            List<DataEvolutionCompactTask> tasks;
+            while (!(tasks = coordinator.plan()).isEmpty()) {
+                for (DataEvolutionCompactTask task : tasks) {
+                    messages.add(task.doCompact(table, "test-compact"));
+                }
+            }
+        } catch (EndOfScanException ignore) {
+        }
+        if (!messages.isEmpty()) {
+            table.newBatchWriteBuilder().newCommit().commit(messages);
+        }
     }
 
     private static String rowToStringWithStruct(InternalRow row, RowType type) {

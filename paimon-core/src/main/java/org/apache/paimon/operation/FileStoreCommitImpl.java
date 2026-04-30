@@ -318,6 +318,10 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                     checkAppendFiles = true;
                     allowRollback = true;
                 }
+                if (conflictDetection.hasRowIdCheckFromSnapshot()) {
+                    checkAppendFiles = true;
+                    allowRollback = true;
+                }
 
                 attempts +=
                         tryCommit(
@@ -539,6 +543,9 @@ public class FileStoreCommitImpl implements FileStoreCommit {
 
     private List<ManifestEntry> tryUpgrade(List<ManifestEntry> appendFiles) {
         if (!options.overwriteUpgrade()) {
+            return appendFiles;
+        }
+        if (options.pkClusteringOverride()) {
             return appendFiles;
         }
         Comparator<InternalRow> keyComparator = conflictDetection.keyComparator();

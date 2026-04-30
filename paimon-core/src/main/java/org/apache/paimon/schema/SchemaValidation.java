@@ -204,13 +204,6 @@ public class SchemaValidation {
                             CoreOptions.STREAMING_READ_APPEND_OVERWRITE.key()));
         }
 
-        if (schema.options().containsKey(CoreOptions.PARTITION_EXPIRATION_TIME.key())) {
-            if (schema.partitionKeys().isEmpty()) {
-                throw new IllegalArgumentException(
-                        "Can not set 'partition.expiration-time' for non-partitioned table.");
-            }
-        }
-
         String recordLevelTimeField = options.recordLevelTimeField();
         if (recordLevelTimeField != null) {
             Optional<DataField> field =
@@ -522,7 +515,7 @@ public class SchemaValidation {
                         || options.changelogProducer() == ChangelogProducer.LOOKUP,
                 "Deletion vectors mode is only supported for NONE/INPUT/LOOKUP changelog producer now.");
 
-        // pk-clustering-override mode requires deletion vectors even for first-row
+        // pk-clustering-override mode allows deletion vectors for first-row
         if (!options.pkClusteringOverride()) {
             checkArgument(
                     !options.mergeEngine().equals(MergeEngine.FIRST_ROW),
@@ -648,13 +641,13 @@ public class SchemaValidation {
         boolean rowTrackingEnabled = options.rowTrackingEnabled();
         if (rowTrackingEnabled) {
             checkArgument(
-                    options.bucket() == -1,
-                    "Cannot define %s for row tracking table, it only support bucket = -1",
-                    CoreOptions.BUCKET.key());
-            checkArgument(
                     schema.primaryKeys().isEmpty(),
                     "Cannot define %s for row tracking table.",
                     PRIMARY_KEY.key());
+            checkArgument(
+                    options.bucket() == -1,
+                    "Cannot define %s for row tracking table, it only support bucket = -1",
+                    CoreOptions.BUCKET.key());
         }
 
         if (options.dataEvolutionEnabled()) {
@@ -847,7 +840,8 @@ public class SchemaValidation {
                 throw new IllegalArgumentException(
                         "Cannot support 'pk-clustering-override' mode without 'clustering.columns'.");
             }
-            if (!options.deletionVectorsEnabled()) {
+            if (!options.deletionVectorsEnabled()
+                    && options.mergeEngine() != CoreOptions.MergeEngine.FIRST_ROW) {
                 throw new UnsupportedOperationException(
                         "Cannot support deletion-vectors disabled in 'pk-clustering-override' mode.");
             }
