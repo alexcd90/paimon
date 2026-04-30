@@ -83,7 +83,7 @@ git show <commit_hash>
 ```
 
 分析时关注以下维度：
-- **类型判断**：新功能（Feature）/ Bug 修复（Fix）/ 性能优化（Perf）/ 重构（Refactor）/ 文档注释（Docs）/ 测试（Test）/ 其他
+- **类型判断**：新功能（Feature）/ Bug 修复（Fix）/ 性能优化（Perf）/ 重构（Refactor）
 - **影响模块**：从提交信息的 `[模块]` 前缀和改动文件路径推断（如 `[core]`、`[flink]`、`[spark]`、`[python]` 等）
 - **核心变更**：用 1-3 句话描述主要改动内容
 - **关键文件**：列出最核心的改动文件（最多 5 个）
