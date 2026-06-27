@@ -6,13 +6,15 @@
 # "License"); you may not use this file except in compliance
 # with the License.  You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 import os
 import shutil
 import tempfile
@@ -217,6 +219,115 @@ class FileSystemCatalogTest(unittest.TestCase):
         table = catalog.get_table(identifier)
         self.assertEqual(len(table.fields), 2)
 
+    def test_update_column_type_guards_null_to_not_null(self):
+        catalog = CatalogFactory.create({"warehouse": self.warehouse})
+        catalog.create_database("test_db_guard", False)
+
+        def _make_table(name, options):
+            identifier = "test_db_guard.{}".format(name)
+            schema = Schema(
+                fields=[
+                    DataField.from_dict({"id": 0, "name": "k", "type": "INT"}),
+                    DataField.from_dict({"id": 1, "name": "v", "type": "BIGINT"}),
+                ],
+                partition_keys=[], primary_keys=[], options=options, comment="",
+            )
+            catalog.create_table(identifier, schema, False)
+            return identifier
+
+        # Default option (disabled=true) rejects nullable -> not null, mirroring
+        # Java SchemaManager#updateColumnType.
+        default_id = _make_table("default_opt", {})
+        with self.assertRaises(RuntimeError) as ctx:
+            catalog.alter_table(
+                default_id,
+                [SchemaChange.update_column_type(
+                    "v", AtomicType("BIGINT", nullable=False))],
+                False)
+        self.assertIn("nullable to non nullable", str(ctx.exception))
+
+        # Opting out via the table option allows the transition.
+        allowed_id = _make_table(
+            "allow_opt", {"alter-column-null-to-not-null.disabled": "false"})
+        catalog.alter_table(
+            allowed_id,
+            [SchemaChange.update_column_type(
+                "v", AtomicType("BIGINT", nullable=False))],
+            False)
+        table = catalog.get_table(allowed_id)
+        self.assertFalse(table.fields[1].type.nullable)
+
+    def test_update_column_type_rejects_non_executable_cast(self):
+        catalog = CatalogFactory.create({"warehouse": self.warehouse})
+        catalog.create_database("test_db_cast", False)
+
+        identifier = "test_db_cast.ts_table"
+        schema = Schema(
+            fields=[
+                DataField.from_dict({"id": 0, "name": "k", "type": "INT"}),
+                DataField.from_dict({"id": 1, "name": "ts", "type": "TIMESTAMP(3)"}),
+            ],
+            partition_keys=[], primary_keys=[], options={}, comment="",
+        )
+        catalog.create_table(identifier, schema, False)
+
+        # TIMESTAMP -> DECIMAL is logically allowed but has no PyArrow cast
+        # kernel, so the read path could not materialize it. Reject at alter
+        # time (mirrors Java's CastExecutors.resolve(...) != null check) instead
+        # of failing later at read with ArrowNotImplementedError.
+        with self.assertRaises(RuntimeError) as ctx:
+            catalog.alter_table(
+                identifier,
+                [SchemaChange.update_column_type(
+                    "ts", AtomicType("DECIMAL(10, 0)"))],
+                False)
+        self.assertIn("no executable cast", str(ctx.exception))
+
+        # INT -> DECIMAL(10, 2) has a PyArrow kernel but the target precision is
+        # too small to hold an int's range at scale 2 (needs >= 12); the read
+        # path would fail with ArrowInvalid, so reject it at alter time too.
+        with self.assertRaises(RuntimeError) as ctx:
+            catalog.alter_table(
+                identifier,
+                [SchemaChange.update_column_type(
+                    "k", AtomicType("DECIMAL(10, 2)"))],
+                False)
+        self.assertIn("no executable cast", str(ctx.exception))
+
+        # A wide-enough DECIMAL is executable and succeeds.
+        catalog.alter_table(
+            identifier,
+            [SchemaChange.update_column_type("k", AtomicType("DECIMAL(12, 2)"))],
+            False)
+        table = catalog.get_table(identifier)
+        self.assertEqual(table.fields[0].type.type, "DECIMAL(12, 2)")
+
+    def test_update_column_type_parameterized_not_null_target(self):
+        catalog = CatalogFactory.create({"warehouse": self.warehouse})
+        catalog.create_database("test_db_nn_param", False)
+        identifier = "test_db_nn_param.t"
+        schema = Schema(
+            fields=[
+                DataField.from_dict({"id": 0, "name": "v", "type": "INT NOT NULL"}),
+                DataField.from_dict({"id": 1, "name": "s", "type": "STRING"}),
+            ],
+            partition_keys=[], primary_keys=[], options={}, comment="",
+        )
+        catalog.create_table(identifier, schema, False)
+
+        # Widening a non-null INT to a non-null DECIMAL(12, 2) is valid. The
+        # target's to_dict() is "DECIMAL(12, 2) NOT NULL"; the atomic parser must
+        # keep the nullability in `nullable` so the executable-cast check does
+        # not choke on a doubled "NOT NULL NOT NULL" type string.
+        catalog.alter_table(
+            identifier,
+            [SchemaChange.update_column_type(
+                "v", AtomicType("DECIMAL(12, 2)", nullable=False))],
+            False)
+        table = catalog.get_table(identifier)
+        self.assertEqual(table.fields[0].type.type, "DECIMAL(12, 2)")
+        self.assertFalse(table.fields[0].type.nullable)
+
     def test_add_column_before_partition(self):
         catalog = CatalogFactory.create({
             "warehouse": self.warehouse
@@ -409,3 +520,64 @@ class FileSystemCatalogTest(unittest.TestCase):
             identifier, partition_name_pattern='dt=2025*'
         )
         self.assertEqual(len(result.elements), 0)
+
+    def test_drop_partitions(self):
+        """Test drop_partitions removes specified partitions from a table."""
+        catalog = CatalogFactory.create({"warehouse": self.warehouse})
+        catalog.create_database("test_db", False)
+
+        identifier = "test_db.drop_part_tbl"
+        self._create_partitioned_table_with_data(catalog, identifier, [
+            {'dt': '2024-01-01', 'rows': 2},
+            {'dt': '2024-01-02', 'rows': 3},
+            {'dt': '2024-01-03', 'rows': 1},
+        ])
+
+        # Verify all 3 partitions exist
+        result = catalog.list_partitions_paged(identifier)
+        self.assertEqual(len(result.elements), 3)
+
+        # Drop one partition
+        catalog.drop_partitions(identifier, [{'dt': '2024-01-02'}])
+
+        # Verify only 2 partitions remain
+        result = catalog.list_partitions_paged(identifier)
+        self.assertEqual(len(result.elements), 2)
+        specs = sorted(p.spec['dt'] for p in result.elements)
+        self.assertEqual(specs, ['2024-01-01', '2024-01-03'])
+
+    def test_drop_partitions_multiple(self):
+        """Test drop_partitions with multiple partitions at once."""
+        catalog = CatalogFactory.create({"warehouse": self.warehouse})
+        catalog.create_database("test_db", False)
+
+        identifier = "test_db.drop_multi_tbl"
+        self._create_partitioned_table_with_data(catalog, identifier, [
+            {'dt': '2024-01-01', 'rows': 1},
+            {'dt': '2024-01-02', 'rows': 1},
+            {'dt': '2024-01-03', 'rows': 1},
+        ])
+
+        # Drop two partitions at once
+        catalog.drop_partitions(identifier, [
+            {'dt': '2024-01-01'},
+            {'dt': '2024-01-03'},
+        ])
+
+        # Verify only 1 partition remains
+        result = catalog.list_partitions_paged(identifier)
+        self.assertEqual(len(result.elements), 1)
+        self.assertEqual(result.elements[0].spec['dt'], '2024-01-02')
+
+    def test_drop_partitions_empty_list_raises(self):
+        """Test drop_partitions raises ValueError for empty partitions list."""
+        catalog = CatalogFactory.create({"warehouse": self.warehouse})
+        catalog.create_database("test_db", False)
+
+        identifier = "test_db.drop_empty_tbl"
+        self._create_partitioned_table_with_data(catalog, identifier, [
+            {'dt': '2024-01-01', 'rows': 1},
+        ])
+
+        with self.assertRaises(ValueError):
+            catalog.drop_partitions(identifier, [])

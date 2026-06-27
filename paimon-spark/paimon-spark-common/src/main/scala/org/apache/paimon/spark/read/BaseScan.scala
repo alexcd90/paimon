@@ -20,7 +20,7 @@ package org.apache.paimon.spark.read
 
 import org.apache.paimon.CoreOptions
 import org.apache.paimon.partition.PartitionPredicate
-import org.apache.paimon.predicate.{FullTextSearch, Predicate, TopN, VectorSearch}
+import org.apache.paimon.predicate.{FullTextSearch, HybridSearch, Predicate, TopN, VectorSearch}
 import org.apache.paimon.spark.{PaimonBatch, PaimonInputPartition, PaimonNumSplitMetric, PaimonPartitionSizeMetric, PaimonReadBatchTimeMetric, PaimonResultedTableFilesMetric, PaimonResultedTableFilesTaskMetric, SparkTypeUtils}
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
 import org.apache.paimon.spark.schema.PaimonMetadataColumn._
@@ -51,7 +51,9 @@ trait BaseScan extends Scan with SupportsReportStatistics with Logging {
   def pushedLimit: Option[Int] = None
   def pushedTopN: Option[TopN] = None
   def pushedVectorSearch: Option[VectorSearch] = None
+  def pushedHybridSearch: Option[HybridSearch] = None
   def pushedFullTextSearch: Option[FullTextSearch] = None
+  def pushedVariantExtractions: Map[Seq[String], Seq[VariantExtractionInfo]] = Map.empty
 
   // Runtime push down
   val pushedRuntimePartitionFilters: ListBuffer[PartitionPredicate] = ListBuffer.empty
@@ -78,13 +80,17 @@ trait BaseScan extends Scan with SupportsReportStatistics with Logging {
     }
   }
 
+  /** Pruned read RowType, with variant fields rewritten if variant pushdown was accepted. */
   private[paimon] val (readTableRowType, metadataFields) = {
     requiredSchema.fields.foreach(f => checkMetadataColumn(f.name))
     val (_requiredTableFields, _metadataFields) =
       requiredSchema.fields.partition(field => tableRowType.containsField(field.name))
-    val _readTableRowType =
+    val pruned =
       SparkTypeUtils.prunePaimonRowType(StructType(_requiredTableFields), tableRowType)
-    (_readTableRowType, _metadataFields)
+    val withVariants =
+      if (pushedVariantExtractions.isEmpty) pruned
+      else VariantPushDownUtils.rewriteRowType(pruned, pushedVariantExtractions)
+    (withVariants, _metadataFields)
   }
 
   private def checkMetadataColumn(fieldName: String): Unit = {
@@ -185,6 +191,13 @@ trait BaseScan extends Scan with SupportsReportStatistics with Logging {
     } else {
       ""
     }
+    val pushedVariantsStr =
+      if (pushedVariantExtractions.isEmpty) ""
+      else
+        VariantPushDownUtils
+          .describeRewrittenRowType(readTableRowType)
+          .map(s => s", PushedVariants: [$s]")
+          .getOrElse("")
     s"${getClass.getSimpleName}: [${table.name}]" +
       pushedPartitionFiltersStr +
       pushedRuntimePartitionFiltersStr +
@@ -192,6 +205,8 @@ trait BaseScan extends Scan with SupportsReportStatistics with Logging {
       pushedTopN.map(topN => s", TopN: [$topN]").getOrElse("") +
       pushedLimit.map(limit => s", Limit: [$limit]").getOrElse("") +
       pushedVectorSearch.map(vs => s", VectorSearch: [$vs]").getOrElse("") +
-      pushedFullTextSearch.map(fts => s", FullTextSearch: [$fts]").getOrElse("")
+      pushedHybridSearch.map(hs => s", HybridSearch: [$hs]").getOrElse("") +
+      pushedFullTextSearch.map(fts => s", FullTextSearch: [$fts]").getOrElse("") +
+      pushedVariantsStr
   }
 }

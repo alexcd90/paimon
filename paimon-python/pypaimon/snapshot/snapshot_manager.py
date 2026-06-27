@@ -1,19 +1,20 @@
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing,
-#  software distributed under the License is distributed on an
-#  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-#  KIND, either express or implied.  See the License for the
-#  specific language governing permissions and limitations
-#  under the License.
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional
@@ -25,20 +26,45 @@ from pypaimon.common.json_util import JSON
 from pypaimon.snapshot.snapshot import Snapshot
 from pypaimon.snapshot.snapshot_loader import SnapshotLoader
 
+EARLIEST_SNAPSHOT_DEFAULT_RETRY_NUM = 300
+
 
 class SnapshotManager:
     """Manager for snapshot files using unified FileIO."""
 
-    def __init__(self, table):
-        from pypaimon.table.file_store_table import FileStoreTable
+    def __init__(
+        self,
+        file_io: FileIO,
+        table_path: str,
+        branch: Optional[str] = None,
+        snapshot_loader: Optional[SnapshotLoader] = None,
+    ):
+        # Lazy import to avoid a cycle: pypaimon.branch.__init__
+        # eagerly loads FileSystemBranchManager, which imports
+        # SnapshotManager.
+        from pypaimon.branch.branch_manager import BranchManager
 
-        self.table: FileStoreTable = table
-        self.file_io: FileIO = self.table.file_io
-        self.snapshot_loader: Optional[SnapshotLoader] = self.table.catalog_environment.snapshot_loader()
+        self.file_io: FileIO = file_io
+        self.table_path: str = table_path.rstrip('/')
+        self.branch: str = BranchManager.normalize_branch(branch)
+        self.snapshot_loader: Optional[SnapshotLoader] = snapshot_loader
 
-        snapshot_path = self.table.table_path.rstrip('/')
-        self.snapshot_dir = f"{snapshot_path}/snapshot"
+        branch_root = BranchManager.branch_path(self.table_path, self.branch)
+        self.snapshot_dir = f"{branch_root}/snapshot"
         self.latest_file = f"{self.snapshot_dir}/LATEST"
+
+    def copy_with_branch(self, branch_name: str) -> 'SnapshotManager':
+        # Mirrors Java SnapshotManager.copyWithBranch: the new manager
+        # carries a SnapshotLoader rebranched to ``branch_name`` so REST
+        # loads target the correct branch instead of falling back to the
+        # main-branch identifier.
+        rebranched_loader = (
+            self.snapshot_loader.copy_with_branch(branch_name)
+            if self.snapshot_loader is not None
+            else None
+        )
+        return SnapshotManager(
+            self.file_io, self.table_path, branch_name, rebranched_loader)
 
     def get_latest_snapshot(self) -> Optional[Snapshot]:
         """
@@ -134,19 +160,27 @@ class SnapshotManager:
         """Get the file path for the given snapshot ID."""
         return f"{self.snapshot_dir}/snapshot-{snapshot_id}"
 
-    def try_get_earliest_snapshot(self) -> Optional[Snapshot]:
+    def try_get_earliest_snapshot(
+        self, stop_snapshot_id: Optional[int] = None
+    ) -> Optional[Snapshot]:
         earliest_file = f"{self.snapshot_dir}/EARLIEST"
         if self.file_io.exists(earliest_file):
             earliest_content = self.file_io.read_file_utf8(earliest_file)
             earliest_snapshot_id = int(earliest_content.strip())
-            snapshot = self.get_snapshot_by_id(earliest_snapshot_id)
-            if snapshot is None:
-                logger.warning(
-                    "The earliest snapshot or changelog was once identified but disappeared. "
-                    "It might have been expired by other jobs operating on this table."
-                )
-            return snapshot
-        return self.get_snapshot_by_id(1)
+        else:
+            earliest_snapshot_id = 1
+
+        if stop_snapshot_id is None:
+            stop_snapshot_id = earliest_snapshot_id + EARLIEST_SNAPSHOT_DEFAULT_RETRY_NUM
+
+        for snapshot_id in range(earliest_snapshot_id, stop_snapshot_id + 1):
+            snapshot = self.get_snapshot_by_id(snapshot_id)
+            if snapshot is not None:
+                return snapshot
+        raise RuntimeError(
+            f"Cannot find earliest snapshot from #{earliest_snapshot_id} "
+            f"to #{stop_snapshot_id}."
+        )
 
     def earlier_or_equal_time_mills(self, timestamp: int) -> Optional[Snapshot]:
         """
@@ -158,10 +192,13 @@ class SnapshotManager:
         Returns:
             The latest snapshot with time_millis <= timestamp, or None if no such snapshot exists
         """
-        earliest_snap = self.try_get_earliest_snapshot()
         latest_snap = self.get_latest_snapshot()
 
-        if earliest_snap is None or latest_snap is None:
+        if latest_snap is None:
+            return None
+
+        earliest_snap = self.try_get_earliest_snapshot(latest_snap.id)
+        if earliest_snap is None:
             return None
 
         earliest = earliest_snap.id
@@ -199,6 +236,89 @@ class SnapshotManager:
                 break
 
         return final_snapshot
+
+    def list_snapshots(self) -> List[Snapshot]:
+        """Return every persisted snapshot in ascending ID order.
+
+        Scans ``snapshot_dir`` for ``snapshot-N`` files and decodes
+        each. IDs whose file is missing (because a previous expire
+        cleaned them) are skipped silently, so the result reflects
+        only snapshots that can still be inspected.
+        """
+        import re
+
+        if not self.file_io.exists(self.snapshot_dir):
+            return []
+
+        file_infos = self.file_io.list_status(self.snapshot_dir)
+        if file_infos is None:
+            return []
+
+        pattern = re.compile(r'^snapshot-(\d+)$')
+        ids = []
+        for file_info in file_infos:
+            name = file_info.path.split('/')[-1]
+            match = pattern.match(name)
+            if match:
+                ids.append(int(match.group(1)))
+        ids.sort()
+
+        snapshots: List[Snapshot] = []
+        for snapshot_id in ids:
+            snapshot = self.get_snapshot_by_id(snapshot_id)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return snapshots
+
+    def later_or_equal_watermark(self, watermark: int) -> Optional[Snapshot]:
+        """
+        Find the first snapshot with watermark >= the given value.
+
+        Args:
+            watermark: The watermark value to compare against
+
+        Returns:
+            The first snapshot with watermark >= the given value, or None if
+            no such snapshot exists
+        """
+        earliest_snap = self.try_get_earliest_snapshot()
+        latest_snap = self.get_latest_snapshot()
+
+        if earliest_snap is None or latest_snap is None:
+            return None
+
+        earliest = earliest_snap.id
+        latest = latest_snap.id
+        result = None
+
+        while earliest <= latest:
+            mid = earliest + (latest - earliest) // 2
+            snapshot = self.get_snapshot_by_id(mid)
+
+            if snapshot is None:
+                found = False
+                for i in range(mid + 1, latest + 1):
+                    snapshot = self.get_snapshot_by_id(i)
+                    if snapshot is not None:
+                        mid = i
+                        found = True
+                        break
+                if not found:
+                    latest = mid - 1
+                    continue
+
+            snap_watermark = snapshot.watermark
+            if snap_watermark is None:
+                earliest = mid + 1
+                continue
+
+            if snap_watermark >= watermark:
+                result = snapshot
+                latest = mid - 1
+            else:
+                earliest = mid + 1
+
+        return result
 
     def get_snapshot_by_id(self, snapshot_id: int) -> Optional[Snapshot]:
         """

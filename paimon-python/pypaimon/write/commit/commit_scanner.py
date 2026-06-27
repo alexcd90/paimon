@@ -1,19 +1,19 @@
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing,
-#  software distributed under the License is distributed on an
-#  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-#  KIND, either express or implied.  See the License for the
-#  specific language governing permissions and limitations
-#  under the License.
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 """
 Manifest entries scanner for commit operations.
@@ -21,6 +21,7 @@ Manifest entries scanner for commit operations.
 from typing import Optional, List
 
 from pypaimon.common.predicate_builder import PredicateBuilder
+from pypaimon.manifest.manifest_file_manager import ManifestFileManager
 from pypaimon.manifest.manifest_list_manager import ManifestListManager
 from pypaimon.manifest.schema.manifest_entry import ManifestEntry
 from pypaimon.read.scanner.file_scanner import FileScanner
@@ -95,6 +96,26 @@ class CommitScanner:
             self.table, lambda: ([], None), partition_predicate=partition_filter
         ).read_manifest_entries(delta_manifests)
 
+    def read_incremental_raw_entries_from_changed_partitions(self, snapshot: Snapshot,
+                                                             commit_entries: List[ManifestEntry]):
+        """Like ``read_incremental_entries_from_changed_partitions`` but
+        preserves DELETE entries (kind=1). The regular method funnels through
+        ``read_entries_parallel`` which discards standalone DELETEs.
+        """
+        delta_manifests = self.manifest_list_manager.read_delta(snapshot)
+        if not delta_manifests:
+            return []
+
+        partition_filter = self._build_partition_filter_from_entries(commit_entries)
+        mfm = ManifestFileManager(self.table)
+        entries = []
+        for mf in delta_manifests:
+            for entry in mfm.read(mf.file_name):
+                if partition_filter is not None and not partition_filter.test(entry.partition):
+                    continue
+                entries.append(entry)
+        return entries
+
     def _build_partition_filter_from_entries(self, entries: List[ManifestEntry]):
         """Build a partition predicate that matches all partitions present in the given entries.
 
@@ -121,7 +142,10 @@ class CommitScanner:
         for partition_values in changed_partitions:
             sub_predicates = []
             for i, key in enumerate(partition_keys):
-                sub_predicates.append(predicate_builder.equal(key, partition_values[i]))
+                if partition_values[i] is None:
+                    sub_predicates.append(predicate_builder.is_null(key))
+                else:
+                    sub_predicates.append(predicate_builder.equal(key, partition_values[i]))
             partition_predicates.append(predicate_builder.and_predicates(sub_predicates))
 
         return predicate_builder.or_predicates(partition_predicates)

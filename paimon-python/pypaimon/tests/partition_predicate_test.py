@@ -1,20 +1,19 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 import unittest
 from unittest.mock import Mock, patch
@@ -52,6 +51,7 @@ def _mock_table():
     table.fields = TABLE_FIELDS
     table.partition_keys = ['dt', 'region']
     table.partition_keys_fields = PARTITION_FIELDS
+    table.options.options.get = Mock(return_value="__DEFAULT_PARTITION__")
     return table
 
 
@@ -65,7 +65,7 @@ def _mock_scanner_table():
     table.options.data_evolution_enabled.return_value = False
     table.options.deletion_vectors_enabled.return_value = False
     table.options.scan_manifest_parallelism.return_value = 1
-    table.table_schema = Mock(id=0)
+    table.table_schema = Mock(id=0, fields=TABLE_FIELDS)
     table.schema_manager = Mock()
     table.schema_manager.get_schema.return_value = Mock(fields=TABLE_FIELDS)
     return table
@@ -96,7 +96,6 @@ def _manifest_entry(partition_values):
     )
 
 
-@patch('pypaimon.read.scanner.file_scanner.SnapshotManager')
 @patch('pypaimon.read.scanner.file_scanner.ManifestFileManager')
 @patch('pypaimon.read.scanner.file_scanner.ManifestListManager')
 class TestFileScannerPartitionPredicate(unittest.TestCase):
@@ -154,7 +153,6 @@ class TestFileScannerPartitionPredicate(unittest.TestCase):
             _manifest_entry(['2024-01-15', 'us-west-2'])))
 
 
-@patch('pypaimon.write.file_store_commit.SnapshotManager')
 @patch('pypaimon.write.file_store_commit.ManifestFileManager')
 @patch('pypaimon.write.file_store_commit.ManifestListManager')
 class TestOverwritePartitionPredicate(unittest.TestCase):
@@ -183,9 +181,9 @@ class TestOverwritePartitionPredicate(unittest.TestCase):
             return mock_cls.call_args[1]['partition_predicate']
 
     def test_overwrite_rejects_mismatched_partition(self, *_):
-        commit = self._create_commit(stub_commit=False)
+        commit = self._create_commit()
         with self.assertRaises(RuntimeError) as ctx:
-            commit.overwrite(self._TARGET, [self._msg(('2024-01-15', 'us-west-2'))], 1)
+            commit._create_static_partition_filter(self._TARGET, [self._msg(('2024-01-15', 'us-west-2'))])
         self.assertIn('does not belong to this partition', str(ctx.exception))
 
     def test_overwrite_passes_partition_scoped_predicate(self, *_):
@@ -208,6 +206,89 @@ class TestOverwritePartitionPredicate(unittest.TestCase):
         self.assertTrue(pred.test(OffsetRow(('2024-01-16', 'us-west-2'), 0, 2)))
         self.assertFalse(pred.test(OffsetRow(('2024-01-17', 'eu-west-1'), 0, 2)))
 
+    def test_overwrite_null_partition_value(self, *_):
+        """Test that overwrite with None partition value uses isNull predicate."""
+        commit = self._create_commit()
+        target = {'dt': None, 'region': 'us-east-1'}
+        commit.overwrite(target, [self._msg((None, 'us-east-1'))], 1)
+
+        pred = self._extract_partition_predicate(commit)
+        # Should match rows where dt is None and region is 'us-east-1'
+        self.assertTrue(pred.test(OffsetRow((None, 'us-east-1'), 0, 2)))
+        # Should not match rows where dt has a value
+        self.assertFalse(pred.test(OffsetRow(('2024-01-15', 'us-east-1'), 0, 2)))
+        # Should not match rows where region differs
+        self.assertFalse(pred.test(OffsetRow((None, 'us-west-2'), 0, 2)))
+
+    def test_overwrite_default_partition_name_treated_as_null(self, *_):
+        """Test that overwrite with default partition name string is treated as null."""
+        commit = self._create_commit()
+        target = {'dt': '__DEFAULT_PARTITION__', 'region': 'us-east-1'}
+        commit.overwrite(target, [self._msg((None, 'us-east-1'))], 1)
+
+        pred = self._extract_partition_predicate(commit)
+        # __DEFAULT_PARTITION__ should be treated like None (isNull)
+        self.assertTrue(pred.test(OffsetRow((None, 'us-east-1'), 0, 2)))
+        self.assertFalse(pred.test(OffsetRow(('2024-01-15', 'us-east-1'), 0, 2)))
+
+    def test_overwrite_all_null_partition_values(self, *_):
+        """Test overwrite where all partition values are None."""
+        commit = self._create_commit()
+        target = {'dt': None, 'region': None}
+        commit.overwrite(target, [self._msg((None, None))], 1)
+
+        pred = self._extract_partition_predicate(commit)
+        self.assertTrue(pred.test(OffsetRow((None, None), 0, 2)))
+        self.assertFalse(pred.test(OffsetRow((None, 'us-east-1'), 0, 2)))
+        self.assertFalse(pred.test(OffsetRow(('2024-01-15', None), 0, 2)))
+
+    def test_overwrite_null_partition_rejects_mismatched(self, *_):
+        """Test that overwrite with null partition rejects rows that don't match."""
+        commit = self._create_commit()
+        target = {'dt': None, 'region': 'us-east-1'}
+        # Trying to overwrite null dt partition with data that has a non-null dt
+        with self.assertRaises(RuntimeError) as ctx:
+            commit._create_static_partition_filter(target, [self._msg(('2024-01-15', 'us-east-1'))])
+        self.assertIn('does not belong to this partition', str(ctx.exception))
+
+    def test_dynamic_overwrite_null_partition_value(self, *_):
+        """Test dynamic partition overwrite with None partition values."""
+        commit = self._create_commit()
+        self.table.options.dynamic_partition_overwrite.return_value = True
+        commit.overwrite({}, [self._msg((None, 'us-east-1'))], 1)
+
+        pred = self._extract_partition_predicate(commit)
+        self.assertTrue(pred.test(OffsetRow((None, 'us-east-1'), 0, 2)))
+        self.assertFalse(pred.test(OffsetRow(('2024-01-15', 'us-east-1'), 0, 2)))
+
+    def test_dynamic_overwrite_mixed_null_and_nonnull(self, *_):
+        """Test dynamic partition overwrite with both null and non-null partitions."""
+        commit = self._create_commit()
+        self.table.options.dynamic_partition_overwrite.return_value = True
+        commit.overwrite({}, [
+            self._msg(('2024-01-15', 'us-east-1')),
+            self._msg((None, 'us-west-2')),
+        ], 1)
+
+        pred = self._extract_partition_predicate(commit)
+        self.assertTrue(pred.test(OffsetRow(('2024-01-15', 'us-east-1'), 0, 2)))
+        self.assertTrue(pred.test(OffsetRow((None, 'us-west-2'), 0, 2)))
+        self.assertFalse(pred.test(OffsetRow(('2024-01-16', 'eu-west-1'), 0, 2)))
+
+    def test_drop_partitions_null_partition_value(self, *_):
+        """Test drop_partitions with default partition name string representing null."""
+        commit = self._create_commit()
+        commit.drop_partitions([
+            {'dt': '__DEFAULT_PARTITION__', 'region': 'us-east-1'},
+            {'dt': '2024-01-16', 'region': 'us-west-2'},
+        ], 1)
+
+        pred = self._extract_partition_predicate(commit)
+        self.assertTrue(pred.test(OffsetRow((None, 'us-east-1'), 0, 2)))
+        self.assertTrue(pred.test(OffsetRow(('2024-01-16', 'us-west-2'), 0, 2)))
+        self.assertFalse(pred.test(OffsetRow(('2024-01-15', 'us-east-1'), 0, 2)))
+        self.assertFalse(pred.test(OffsetRow((None, 'us-west-2'), 0, 2)))
+
 
 class TestCommitScannerPartitionPredicate(unittest.TestCase):
 
@@ -224,6 +305,18 @@ class TestCommitScannerPartitionPredicate(unittest.TestCase):
         self.assertTrue(pred.test(GenericRow(['2024-01-15', 'us-east-1'], PARTITION_FIELDS)))
         self.assertTrue(pred.test(GenericRow(['2024-01-16', 'us-west-2'], PARTITION_FIELDS)))
         self.assertFalse(pred.test(GenericRow(['2024-01-17', 'eu-west-1'], PARTITION_FIELDS)))
+
+    def test_filter_handles_null_partition_values(self):
+        scanner = self._scanner()
+        pred = scanner._build_partition_filter_from_entries([
+            _manifest_entry([None, 'us-east-1']),
+            _manifest_entry(['2024-01-16', 'us-west-2']),
+        ])
+
+        self.assertTrue(pred.test(GenericRow([None, 'us-east-1'], PARTITION_FIELDS)))
+        self.assertTrue(pred.test(GenericRow(['2024-01-16', 'us-west-2'], PARTITION_FIELDS)))
+        self.assertFalse(pred.test(GenericRow(['2024-01-15', 'us-east-1'], PARTITION_FIELDS)))
+        self.assertFalse(pred.test(GenericRow([None, 'us-west-2'], PARTITION_FIELDS)))
 
     def test_filter_none_without_partition_keys(self):
         scanner = CommitScanner(Mock(partition_keys=[]), Mock())
@@ -252,3 +345,38 @@ class TestCommitScannerPartitionPredicate(unittest.TestCase):
                 self.assertIn('partition_predicate', kwargs)
                 self.assertIsNotNone(kwargs['partition_predicate'])
                 self.assertNotIn('predicate', kwargs)
+
+    @patch('pypaimon.write.commit.commit_scanner.ManifestFileManager')
+    def test_raw_entries_preserve_delete_kind(self, mock_mfm_cls):
+        added = ManifestEntry(
+            kind=0, partition=GenericRow(['p1', 'us'], PARTITION_FIELDS),
+            bucket=0, total_buckets=1, file=Mock())
+        deleted = ManifestEntry(
+            kind=1, partition=GenericRow(['p1', 'us'], PARTITION_FIELDS),
+            bucket=0, total_buckets=1, file=Mock())
+        mock_mfm_cls.return_value.read.return_value = [added, deleted]
+
+        scanner = self._scanner()
+        scanner.manifest_list_manager.read_delta.return_value = [Mock(file_name='m1')]
+        result = scanner.read_incremental_raw_entries_from_changed_partitions(
+            Mock(), [_manifest_entry(['p1', 'us'])])
+
+        self.assertEqual([e.kind for e in result], [0, 1])
+
+    @patch('pypaimon.write.commit.commit_scanner.ManifestFileManager')
+    def test_raw_entries_filter_unmatched_partition(self, mock_mfm_cls):
+        in_part = ManifestEntry(
+            kind=1, partition=GenericRow(['p1', 'us'], PARTITION_FIELDS),
+            bucket=0, total_buckets=1, file=Mock())
+        out_part = ManifestEntry(
+            kind=1, partition=GenericRow(['p2', 'eu'], PARTITION_FIELDS),
+            bucket=0, total_buckets=1, file=Mock())
+        mock_mfm_cls.return_value.read.return_value = [in_part, out_part]
+
+        scanner = self._scanner()
+        scanner.manifest_list_manager.read_delta.return_value = [Mock(file_name='m1')]
+        result = scanner.read_incremental_raw_entries_from_changed_partitions(
+            Mock(), [_manifest_entry(['p1', 'us'])])
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(tuple(result[0].partition.values), ('p1', 'us'))

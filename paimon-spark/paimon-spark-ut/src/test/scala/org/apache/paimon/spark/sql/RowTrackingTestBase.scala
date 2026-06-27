@@ -19,12 +19,18 @@
 package org.apache.paimon.spark.sql
 
 import org.apache.paimon.Snapshot.CommitKind
+import org.apache.paimon.spark.PaimonMetrics.RESULTED_TABLE_FILES
 import org.apache.paimon.spark.PaimonSparkTestBase
+import org.apache.paimon.spark.read.PaimonSplitScan
 import org.apache.paimon.table.source.DataSplit
 
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.catalyst.plans.logical.{Deduplicate, Join, LogicalPlan, MergeRows, RepartitionByExpression, Sort}
+import org.apache.spark.sql.catalyst.plans.logical.{Deduplicate, Join, LogicalPlan, MergeRows, RepartitionByExpression, Sort, SubqueryAlias}
+import org.apache.spark.sql.connector.metric.CustomTaskMetric
 import org.apache.spark.sql.execution.QueryExecution
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
+import org.apache.spark.sql.paimon.Utils
 import org.apache.spark.sql.util.QueryExecutionListener
 
 import java.util.concurrent.{CountDownLatch, TimeUnit}
@@ -34,9 +40,46 @@ import scala.concurrent.{Await, Future}
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration.DurationInt
 
-abstract class RowTrackingTestBase extends PaimonSparkTestBase {
+abstract class RowTrackingTestBase extends PaimonSparkTestBase with AdaptiveSparkPlanHelper {
 
   import testImplicits._
+
+  private val MaxRetryAttempts = 20
+  private val RetryIntervalMillis = 10L
+
+  private def doWithRetry(doAction: () => Unit, retryableMessages: String*): Unit = {
+    var attempts = 0
+    while (true) {
+      try {
+        doAction.apply()
+        return
+      } catch {
+        case e: Exception =>
+          attempts += 1
+          if (!isRetryable(e, retryableMessages) || attempts >= MaxRetryAttempts) {
+            throw e
+          }
+          Thread.sleep(RetryIntervalMillis)
+      }
+    }
+  }
+
+  private def isRetryable(e: Throwable, retryableMessages: Seq[String]): Boolean = {
+    hasMessage(e, "Snapshot file", "does not exist") ||
+    retryableMessages.exists(message => hasMessage(e, message))
+  }
+
+  private def hasMessage(e: Throwable, fragments: String*): Boolean = {
+    var current = e
+    while (current != null) {
+      val message = current.getMessage
+      if (message != null && fragments.forall(message.contains)) {
+        return true
+      }
+      current = current.getCause
+    }
+    false
+  }
 
   test("Data Evolution: concurrent merge and compact") {
     withTable("s", "t") {
@@ -98,27 +141,16 @@ abstract class RowTrackingTestBase extends PaimonSparkTestBase {
       Seq((1, 1, 1)).toDF("id", "b", "c").createOrReplaceTempView("s")
 
       def doMerge(): Unit = {
-        var success = false
-        while (!success) {
-          try {
-            sql(s"""
-                   |MERGE INTO t
-                   |USING s
-                   |ON t.id = s.id
-                   |WHEN MATCHED THEN
-                   |UPDATE SET t.id = s.id, t.b = s.b + t.b, t.c = s.c + t.c
-                   |""".stripMargin).collect()
-            success = true
-          } catch {
-            case e: Exception =>
-              if (
-                !e.getMessage.contains(
-                  "multiple 'MERGE INTO' operations have encountered conflicts")
-              ) {
-                throw e
-              }
-          }
-        }
+        doWithRetry(
+          () => sql(s"""
+                       |MERGE INTO t
+                       |USING s
+                       |ON t.id = s.id
+                       |WHEN MATCHED THEN
+                       |UPDATE SET t.id = s.id, t.b = s.b + t.b, t.c = s.c + t.c
+                       |""".stripMargin).collect(),
+          "multiple 'MERGE INTO' operations have encountered conflicts"
+        )
       }
 
       val mergeInto1 = Future {
@@ -140,6 +172,48 @@ abstract class RowTrackingTestBase extends PaimonSparkTestBase {
     }
   }
 
+  test("Data Evolution: concurrent merge with disjoint update columns") {
+    withTable("sb", "sc", "t") {
+      sql(s"""
+            CREATE TABLE t (id INT, b INT, c INT) TBLPROPERTIES (
+                 'row-tracking.enabled' = 'true',
+                 'data-evolution.enabled' = 'true')
+          """)
+      sql("INSERT INTO t VALUES (1, 0, 0)")
+      Seq((1, 1)).toDF("id", "b").createOrReplaceTempView("sb")
+      Seq((1, 1)).toDF("id", "c").createOrReplaceTempView("sc")
+
+      val mergeB = Future {
+        for (_ <- 1 to 10) {
+          doWithRetry(() => sql(s"""
+                                   |MERGE INTO t
+                                   |USING sb
+                                   |ON t.id = sb.id
+                                   |WHEN MATCHED THEN
+                                   |UPDATE SET t.b = sb.b + t.b
+                                   |""".stripMargin).collect())
+        }
+      }
+
+      val mergeC = Future {
+        for (_ <- 1 to 10) {
+          doWithRetry(() => sql(s"""
+                                   |MERGE INTO t
+                                   |USING sc
+                                   |ON t.id = sc.id
+                                   |WHEN MATCHED THEN
+                                   |UPDATE SET t.c = sc.c + t.c
+                                   |""".stripMargin).collect())
+        }
+      }
+
+      Await.result(mergeB, 60.seconds)
+      Await.result(mergeC, 60.seconds)
+
+      checkAnswer(sql("SELECT * FROM t"), Seq(Row(1, 10, 10)))
+    }
+  }
+
   test("Data Evolution: concurrent merge and small files compact") {
     withTable("s", "t") {
       sql(s"""
@@ -151,30 +225,19 @@ abstract class RowTrackingTestBase extends PaimonSparkTestBase {
       sql("INSERT INTO t VALUES (1, 0, 0)")
       Seq((1, 1, 1)).toDF("id", "b", "c").createOrReplaceTempView("s")
 
-      def doWithRetry(doAction: () => Unit): Unit = {
-        var success = false
-        while (!success) {
-          try {
-            doAction.apply()
-            success = true
-          } catch {
-            case e: Exception =>
-              if (!e.getMessage.contains("multiple 'MERGE INTO' and 'COMPACT' operations")) {
-                throw e
-              }
-          }
-        }
-      }
-
       val mergeInto = Future {
         for (i <- 1 to 10) {
-          doWithRetry(() => sql(s"""
-                                   |MERGE INTO t
-                                   |USING s
-                                   |ON t.id = s.id
-                                   |WHEN MATCHED THEN
-                                   |UPDATE SET t.id = s.id, t.b = s.b + t.b, t.c = s.c + t.c
-                                   |""".stripMargin).collect())
+          doWithRetry(
+            () => sql(s"""
+                         |MERGE INTO t
+                         |USING s
+                         |ON t.id = s.id
+                         |WHEN MATCHED THEN
+                         |UPDATE SET t.id = s.id, t.b = s.b + t.b, t.c = s.c + t.c
+                         |""".stripMargin).collect(),
+            "multiple 'MERGE INTO' and 'COMPACT' operations",
+            "Row ID existence conflict"
+          )
           if (i > 1) {
             sql(s"INSERT INTO t VALUES ($i, $i, $i)")
           }
@@ -193,7 +256,10 @@ abstract class RowTrackingTestBase extends PaimonSparkTestBase {
           while (!canBeCompacted) {
             Thread.sleep(1)
           }
-          doWithRetry(() => sql("CALL sys.compact(table => 't')"))
+          doWithRetry(
+            () => sql("CALL sys.compact(table => 't')"),
+            "multiple 'MERGE INTO' and 'COMPACT' operations",
+            "Row ID existence conflict")
         }
       }
 
@@ -252,6 +318,37 @@ abstract class RowTrackingTestBase extends PaimonSparkTestBase {
         sql("SELECT *, _ROW_ID, _SEQUENCE_NUMBER FROM t ORDER BY id"),
         Seq(Row(1, 1, 0, 1), Row(2, 2, 1, 2), Row(3, 3, 2, 3))
       )
+
+      sql("INSERT INTO t VALUES (4, '4')")
+      sql("INSERT INTO t VALUES (5, '5')")
+      // snapshot 7: should merge files with sequence numbers [1, 6]
+      sql("CALL sys.compact(table => 't')")
+      checkAnswer(
+        sql("SELECT min_sequence_number, max_sequence_number FROM `t$files`"),
+        Seq(Row(1, 6))
+      )
+      // snapshot 8: Updated record has null sequence number
+      sql("UPDATE t SET data = 22 WHERE id = 2")
+
+      // snapshot 9 ~ 10: add new file, and set sequence number to null
+      sql("INSERT INTO t SELECT /*+ REPARTITION(1) */ id, id AS data FROM range(6, 8)")
+      sql("UPDATE t SET data = 67 WHERE _SEQUENCE_NUMBER = 9")
+      checkAnswer(
+        sql(
+          "SELECT min_sequence_number, max_sequence_number FROM `t$files` order by min_sequence_number"),
+        Seq(Row(1, 8), Row(10, 10))
+      )
+      checkAnswer(
+        sql("SELECT *, _ROW_ID, _SEQUENCE_NUMBER FROM t ORDER BY id"),
+        Seq(
+          Row(1, 1, 0, 1),
+          Row(2, 22, 1, 8),
+          Row(3, 3, 2, 3),
+          Row(4, 4, 3, 5),
+          Row(5, 5, 4, 6),
+          Row(6, 67, 5, 10),
+          Row(7, 67, 6, 10))
+      )
     }
   }
 
@@ -280,6 +377,21 @@ abstract class RowTrackingTestBase extends PaimonSparkTestBase {
           Seq(Row(1, 1, 0, 1))
         )
       }
+    }
+  }
+
+  test("Row Tracking: delete preserves row tracking metadata for update") {
+    withTable("t") {
+      sql("CREATE TABLE t (id INT, data INT) TBLPROPERTIES ('row-tracking.enabled' = 'true')")
+      sql("INSERT INTO t SELECT /*+ REPARTITION(1) */ id, id AS data FROM range(1, 4)")
+
+      sql("DELETE FROM t WHERE id = 2")
+      sql("UPDATE t SET data = 33 WHERE _ROW_ID = 2")
+
+      checkAnswer(
+        sql("SELECT *, _ROW_ID, _SEQUENCE_NUMBER FROM t ORDER BY id"),
+        Seq(Row(1, 1, 0, 1), Row(3, 33, 2, 3))
+      )
     }
   }
 
@@ -581,6 +693,174 @@ abstract class RowTrackingTestBase extends PaimonSparkTestBase {
           Row(9, 990, "c99", 6, 2))
       )
     }
+  }
+
+  Seq(false, true).foreach {
+    filePruning =>
+      test(s"Data Evolution: merge into file pruning: $filePruning") {
+        withSparkSQLConf(
+          "spark.paimon.data-evolution.merge-into.file-pruning" ->
+            filePruning.toString) {
+          withTable("source", "target") {
+            sql("CREATE TABLE source (id INT, b INT, dt STRING)")
+            sql("INSERT INTO source VALUES (1, 100, '2026-05-28'), (3, 300, '2026-05-28')")
+
+            sql("""
+                  |CREATE TABLE target (id INT, b INT, c STRING, dt STRING)
+                  |TBLPROPERTIES (
+                  |  'row-tracking.enabled' = 'true',
+                  |  'data-evolution.enabled' = 'true')
+                  |PARTITIONED BY (dt)
+                  |""".stripMargin)
+            sql("INSERT INTO target VALUES (1, 10, 'old-1', '2026-05-28'), (2, 20, 'old-2', '2026-05-28'), (4, 40, 'old-4', '2026-05-29')")
+
+            executeMergeIntoAndAssertFilePruning(
+              """
+                |MERGE INTO target
+                |USING source
+                |ON target.id = source.id AND target.dt = source.dt
+                |WHEN MATCHED THEN UPDATE SET target.b = source.b
+                |WHEN NOT MATCHED THEN INSERT (id, b, c, dt) VALUES (id, b, 'new', dt)
+                |""".stripMargin,
+              filePruning
+            )
+
+            checkAnswer(
+              sql("SELECT id, b, c, dt FROM target ORDER BY id"),
+              Seq(
+                Row(1, 100, "old-1", "2026-05-28"),
+                Row(2, 20, "old-2", "2026-05-28"),
+                Row(3, 300, "new", "2026-05-28"),
+                Row(4, 40, "old-4", "2026-05-29"))
+            )
+          }
+        }
+      }
+  }
+
+  private def executeMergeIntoAndAssertFilePruning(mergeSql: String, filePruning: Boolean): Unit = {
+    @volatile var hasTargetFilePruningJoin = false
+    val listener = new QueryExecutionListener {
+      override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = {
+        checkPlan(qe.analyzed)
+      }
+
+      override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = {
+        checkPlan(qe.analyzed)
+      }
+
+      private def checkPlan(plan: LogicalPlan): Unit = {
+        if (isTargetFilePruningJoinPlan(plan)) {
+          hasTargetFilePruningJoin = true
+          assert(
+            filePruning,
+            s"File pruning join should be skipped when file pruning is disabled: $plan")
+        }
+      }
+    }
+
+    spark.listenerManager.register(listener)
+    try {
+      sql(mergeSql)
+      Utils.waitUntilEventEmpty(spark)
+    } finally {
+      spark.listenerManager.unregister(listener)
+    }
+
+    if (filePruning) {
+      assert(hasTargetFilePruningJoin, "Expected target file pruning join plan.")
+    }
+  }
+
+  private def isTargetFilePruningJoinPlan(plan: LogicalPlan): Boolean = {
+    plan.collectFirst { case _: Deduplicate => true }.nonEmpty &&
+    plan.collectFirst { case _: Join => true }.nonEmpty &&
+    plan.collectFirst {
+      case SubqueryAlias(identifier, _) if identifier.name == "_left" => true
+    }.nonEmpty &&
+    plan.collectFirst { case _: MergeRows => true }.isEmpty
+  }
+
+  test("Data Evolution: merge into skip file pruning push down partition filter in on condition") {
+    withSparkSQLConf("spark.paimon.data-evolution.merge-into.file-pruning" -> "false") {
+      withTempView("source") {
+        withTable("target") {
+          Seq((1, 100), (2, 200), (3, 300)).toDF("id", "b").createOrReplaceTempView("source")
+
+          sql("""
+                |CREATE TABLE target (id INT, b INT, dt STRING)
+                |TBLPROPERTIES (
+                |  'row-tracking.enabled' = 'true',
+                |  'data-evolution.enabled' = 'true')
+                |PARTITIONED BY (dt)
+                |""".stripMargin)
+          sql("""
+                |INSERT INTO target VALUES
+                |  (1, 10, '2026-05-28'),
+                |  (2, 20, '2026-05-29'),
+                |  (3, 30, '2026-05-30')
+                |""".stripMargin)
+
+          val mergeSql =
+            """
+              |MERGE INTO target
+              |USING source
+              |ON target.id = source.id AND target.dt = '2026-05-28'
+              |WHEN MATCHED THEN UPDATE SET target.b = source.b
+              |""".stripMargin
+
+          executeMergeIntoAndAssertPartitionPruned(mergeSql)
+          checkAnswer(
+            sql("SELECT id, b, dt FROM target ORDER BY id"),
+            Seq(Row(1, 100, "2026-05-28"), Row(2, 20, "2026-05-29"), Row(3, 30, "2026-05-30"))
+          )
+        }
+      }
+    }
+  }
+
+  private def executeMergeIntoAndAssertPartitionPruned(mergeSql: String): Unit = {
+    val resultedTableFiles = new java.util.concurrent.CopyOnWriteArrayList[Long]()
+
+    val listener = new QueryExecutionListener {
+      override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = {
+        checkPlan(qe)
+      }
+
+      override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = {
+        checkPlan(qe)
+      }
+
+      private def checkPlan(qe: QueryExecution): Unit = {
+        collect(qe.executedPlan) {
+          case scanExec: BatchScanExec
+              if scanExec.scan.isInstanceOf[PaimonSplitScan] &&
+                scanExec.scan.description().startsWith("PaimonSplitScan: [target]") =>
+            val scan = scanExec.scan.asInstanceOf[PaimonSplitScan]
+            metric(scan.reportDriverMetrics(), RESULTED_TABLE_FILES)
+        }.foreach(resultedTableFile => resultedTableFiles.add(resultedTableFile))
+      }
+    }
+
+    spark.listenerManager.register(listener)
+    try {
+      sql(mergeSql)
+      Utils.waitUntilEventEmpty(spark)
+    } finally {
+      spark.listenerManager.unregister(listener)
+    }
+
+    val metrics = resultedTableFiles.asScala
+    assert(metrics.nonEmpty, "Expected target PaimonSplitScan in merge into executed plans.")
+    assert(
+      metrics.contains(1),
+      s"Expected target scan to read only one partition file, but got resulted table files: " +
+        metrics.mkString(", ")
+    )
+  }
+
+  private def metric(metrics: Array[CustomTaskMetric], name: String): Long = {
+    metrics.find(_.name() == name).get.value()
   }
 
   test("Data Evolution: merge into table with data-evolution on _ROW_ID") {

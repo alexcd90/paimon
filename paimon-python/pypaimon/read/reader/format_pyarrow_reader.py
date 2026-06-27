@@ -1,20 +1,19 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 from typing import Any, Dict, List, Optional
 
@@ -48,33 +47,64 @@ class FormatPyArrowReader(RecordBatchReader):
     def __init__(self, file_io: FileIO, file_format: str, file_path: str,
                  read_fields: List[DataField],
                  push_down_predicate: Any, batch_size: int = 1024,
-                 options: CoreOptions = None):
+                 options: CoreOptions = None,
+                 nested_name_paths: Optional[List[List[str]]] = None):
         file_path_for_pyarrow = file_io.to_filesystem_path(file_path)
         self.dataset = ds.dataset(file_path_for_pyarrow, format=file_format, filesystem=file_io.filesystem)
         self._file_format = file_format
         self.read_fields = read_fields
         self._read_field_names = [f.name for f in read_fields]
 
-        # Identify which fields exist in the file and which are missing
-        file_schema = self.dataset.schema
-        file_schema_names = set(file_schema.names)
-        self.existing_fields = [f.name for f in read_fields if f.name in file_schema_names]
-        self.missing_fields = [f.name for f in read_fields if f.name not in file_schema_names]
+        if nested_name_paths is not None and len(nested_name_paths) != len(read_fields):
+            raise ValueError(
+                "nested_name_paths length {} does not match read_fields length {}".format(
+                    len(nested_name_paths), len(read_fields)))
+        self._nested_name_paths = nested_name_paths
+        has_nested_path = bool(
+            nested_name_paths and any(len(p) > 1 for p in nested_name_paths))
 
-        # column name → VariantSchema for shredded columns that need assembly
+        file_schema = self.dataset.schema
+        if has_nested_path:
+            self.existing_fields = []
+            self.missing_fields = []
+            for f, path in zip(read_fields, nested_name_paths):
+                if _path_exists_in_arrow_schema(file_schema, path):
+                    self.existing_fields.append(f.name)
+                else:
+                    self.missing_fields.append(f.name)
+        else:
+            file_schema_names = set(file_schema.names)
+            self.existing_fields = [f.name for f in read_fields if f.name in file_schema_names]
+            self.missing_fields = [f.name for f in read_fields if f.name not in file_schema_names]
+
         self._shredded_schemas: Dict[str, VariantSchema] = {}
         if options is None or options.variant_shredding_enabled():
+            top_level_names = set(file_schema.names)
             for name in self.existing_fields:
+                if name not in top_level_names:
+                    continue
                 field_type = file_schema.field(name).type
                 if is_shredded_variant(field_type):
                     self._shredded_schemas[name] = build_variant_schema(field_type)
 
-        # Only pass existing fields to PyArrow scanner to avoid errors
-        self.reader = self.dataset.scanner(
-            columns=self.existing_fields,
-            filter=push_down_predicate,
-            batch_size=batch_size
-        ).to_reader()
+        if has_nested_path:
+            existing_set = set(self.existing_fields)
+            columns_dict = {}
+            for f, path in zip(read_fields, nested_name_paths):
+                if f.name in existing_set:
+                    columns_dict[f.name] = ds.field(*path)
+            self.reader = self.dataset.scanner(
+                columns=columns_dict,
+                filter=push_down_predicate,
+                batch_size=batch_size
+            ).to_reader()
+        else:
+            # Only pass existing fields to PyArrow scanner to avoid errors
+            self.reader = self.dataset.scanner(
+                columns=self.existing_fields,
+                filter=push_down_predicate,
+                batch_size=batch_size
+            ).to_reader()
 
         self._output_schema = (
             PyarrowFieldParser.from_paimon_schema(read_fields) if read_fields else None
@@ -169,3 +199,20 @@ class FormatPyArrowReader(RecordBatchReader):
     def close(self):
         if self.reader is not None:
             self.reader = None
+
+
+def _path_exists_in_arrow_schema(schema: pa.Schema, path: List[str]) -> bool:
+    """Check whether a name path is fully resolvable in the given schema."""
+    if not path:
+        return False
+    if path[0] not in schema.names:
+        return False
+    current_type = schema.field(path[0]).type
+    for name in path[1:]:
+        if not pa.types.is_struct(current_type):
+            return False
+        idx = current_type.get_field_index(name)
+        if idx < 0:
+            return False
+        current_type = current_type.field(idx).type
+    return True

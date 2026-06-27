@@ -25,8 +25,7 @@ import org.apache.paimon.fs.FileIOFinder;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.globalindex.GlobalIndexBuilderUtils;
-import org.apache.paimon.globalindex.GlobalIndexParallelWriter;
-import org.apache.paimon.globalindex.GlobalIndexSingletonWriter;
+import org.apache.paimon.globalindex.GlobalIndexSingleColumnWriter;
 import org.apache.paimon.globalindex.ResultEntry;
 import org.apache.paimon.globalindex.btree.BTreeGlobalIndexerFactory;
 import org.apache.paimon.index.IndexFileMeta;
@@ -58,6 +57,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -65,6 +66,7 @@ import java.util.Collections;
 import java.util.List;
 
 import static org.apache.paimon.CoreOptions.DATA_EVOLUTION_ENABLED;
+import static org.apache.paimon.CoreOptions.FILE_FORMAT;
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_ENABLED;
 import static org.apache.paimon.CoreOptions.PATH;
 import static org.apache.paimon.CoreOptions.ROW_TRACKING_ENABLED;
@@ -101,10 +103,12 @@ public class JavaPyLuminaE2ETest {
         warehouse = new Path("file://" + tempDir.resolve("warehouse"));
     }
 
-    @Test
+    @ParameterizedTest
+    @ValueSource(strings = {"orc", "lance"})
     @EnabledIfSystemProperty(named = "run.e2e.tests", matches = "true")
-    public void testLuminaVectorIndexWrite() throws Exception {
-        String tableName = "test_lumina_vector";
+    public void testLuminaVectorIndexWrite(String fileFormat) throws Exception {
+        String tableName =
+                "lance".equals(fileFormat) ? "test_lumina_vector_lance" : "test_lumina_vector";
         Path tablePath = new Path(warehouse.toString() + "/default.db/" + tableName);
 
         int dimension = 4;
@@ -119,6 +123,9 @@ public class JavaPyLuminaE2ETest {
         options.set(ROW_TRACKING_ENABLED, true);
         options.set(DATA_EVOLUTION_ENABLED, true);
         options.set(GLOBAL_INDEX_ENABLED, true);
+        if (!"orc".equals(fileFormat)) {
+            options.setString(FILE_FORMAT.key(), fileFormat);
+        }
         options.setString(LuminaVectorIndexOptions.DIMENSION.key(), String.valueOf(dimension));
         options.setString(LuminaVectorIndexOptions.DISTANCE_METRIC.key(), "l2");
         options.setString(LuminaVectorIndexOptions.ENCODING_TYPE.key(), "rawf32");
@@ -140,7 +147,6 @@ public class JavaPyLuminaE2ETest {
                         tableSchema,
                         CatalogEnvironment.empty());
 
-        // Test vectors: 6 vectors of dimension 4
         float[][] vectors =
                 new float[][] {
                     new float[] {1.0f, 0.0f, 0.0f, 0.0f},
@@ -151,7 +157,6 @@ public class JavaPyLuminaE2ETest {
                     new float[] {0.95f, 0.05f, 0.0f, 0.0f}
                 };
 
-        // Write data rows
         BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
         try (BatchTableWrite write = writeBuilder.newWrite();
                 BatchTableCommit commit = writeBuilder.newCommit()) {
@@ -161,22 +166,19 @@ public class JavaPyLuminaE2ETest {
             commit.commit(write.prepareCommit());
         }
 
-        // Build Lumina vector index on "embedding" column
         DataField embeddingField = table.rowType().getField("embedding");
         Options indexOptions = table.coreOptions().toConfiguration();
-        LuminaVectorIndexOptions luminaOptions = new LuminaVectorIndexOptions(indexOptions);
 
-        GlobalIndexSingletonWriter writer =
-                (GlobalIndexSingletonWriter)
+        GlobalIndexSingleColumnWriter writer =
+                (GlobalIndexSingleColumnWriter)
                         GlobalIndexBuilderUtils.createIndexWriter(
                                 table,
                                 LuminaVectorGlobalIndexerFactory.IDENTIFIER,
                                 embeddingField,
                                 indexOptions);
 
-        // Write vectors to index
-        for (float[] vec : vectors) {
-            writer.write(vec);
+        for (int i = 0; i < vectors.length; i++) {
+            writer.write(vectors[i], i);
         }
 
         List<ResultEntry> entries = writer.finish();
@@ -194,7 +196,6 @@ public class JavaPyLuminaE2ETest {
                         LuminaVectorGlobalIndexerFactory.IDENTIFIER,
                         entries);
 
-        // Commit the index
         DataIncrement dataIncrement = DataIncrement.indexIncrement(indexFiles);
         CommitMessage message =
                 new CommitMessageImpl(
@@ -207,7 +208,6 @@ public class JavaPyLuminaE2ETest {
             commit.commit(Collections.singletonList(message));
         }
 
-        // Verify index was committed
         List<org.apache.paimon.manifest.IndexManifestEntry> indexEntries =
                 table.indexManifestFileReader().read(table.latestSnapshot().get().indexManifest());
         assertThat(indexEntries).hasSize(1);
@@ -279,15 +279,15 @@ public class JavaPyLuminaE2ETest {
 
         // Build Lumina vector index on "embedding".
         DataField embeddingField = table.rowType().getField("embedding");
-        GlobalIndexSingletonWriter vectorWriter =
-                (GlobalIndexSingletonWriter)
+        GlobalIndexSingleColumnWriter vectorWriter =
+                (GlobalIndexSingleColumnWriter)
                         GlobalIndexBuilderUtils.createIndexWriter(
                                 table,
                                 LuminaVectorGlobalIndexerFactory.IDENTIFIER,
                                 embeddingField,
                                 indexOptions);
-        for (float[] vec : vectors) {
-            vectorWriter.write(vec);
+        for (int i = 0; i < vectors.length; i++) {
+            vectorWriter.write(vectors[i], i);
         }
         List<ResultEntry> vectorEntries = vectorWriter.finish();
         List<IndexFileMeta> vectorIndexFiles =
@@ -302,8 +302,8 @@ public class JavaPyLuminaE2ETest {
 
         // Build BTree global index on "id".
         DataField idField = table.rowType().getField("id");
-        GlobalIndexParallelWriter idWriter =
-                (GlobalIndexParallelWriter)
+        GlobalIndexSingleColumnWriter idWriter =
+                (GlobalIndexSingleColumnWriter)
                         GlobalIndexBuilderUtils.createIndexWriter(
                                 table, BTreeGlobalIndexerFactory.IDENTIFIER, idField, indexOptions);
         for (int i = 0; i < vectors.length; i++) {

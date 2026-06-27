@@ -6,13 +6,15 @@
 # "License"); you may not use this file except in compliance
 # with the License.  You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 import os
 import tempfile
 import unittest
@@ -233,7 +235,7 @@ class KerberosHdfsTest(unittest.TestCase):
     @patch("pypaimon.filesystem.pyarrow_file_io.subprocess.run")
     @patch("pypaimon.filesystem.pyarrow_file_io.pafs.HadoopFileSystem")
     def test_hdfs_with_fallback_keys(self, mock_hdfs_fs, mock_subprocess_run):
-        """Verify that Java-compatible fallback keys security.principal / security.keytab work."""
+        """Verify that the secondary fallback keys security.principal / security.keytab work."""
         mock_subprocess_run.return_value = MagicMock(stdout="/some/classpath")
 
         with tempfile.NamedTemporaryFile(suffix=".keytab") as keytab_file:

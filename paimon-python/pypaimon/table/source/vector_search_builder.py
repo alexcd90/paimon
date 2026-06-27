@@ -1,20 +1,19 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 """Builder to build vector search."""
 
@@ -45,6 +44,20 @@ class VectorSearchBuilder(ABC):
         # type: (list) -> VectorSearchBuilder
         """The query vector (list of floats)."""
         pass
+
+    def with_option(self, key, value):
+        # type: (str, str) -> VectorSearchBuilder
+        """Option for vector indexes."""
+        raise NotImplementedError(
+            "%s does not support vector options."
+            % self.__class__.__name__)
+
+    def with_options(self, options):
+        # type: (dict) -> VectorSearchBuilder
+        """Options for vector indexes."""
+        raise NotImplementedError(
+            "%s does not support vector options."
+            % self.__class__.__name__)
 
     @abstractmethod
     def with_filter(self, predicate):
@@ -78,16 +91,16 @@ class VectorSearchBuilder(ABC):
         )
 
 
-class VectorSearchBuilderImpl(VectorSearchBuilder):
-    """Implementation for VectorSearchBuilder."""
+class AbstractVectorSearchBuilderImpl:
+    """Shared state and filter/partition handling for the vector search builders."""
 
     def __init__(self, table):
         self._table = table
         self._limit = 0
         self._vector_column = None
-        self._query_vector = None
         self._filter = None
         self._partition_filter = None
+        self._options = {}
 
     def with_limit(self, limit):
         # type: (int) -> VectorSearchBuilder
@@ -102,9 +115,15 @@ class VectorSearchBuilderImpl(VectorSearchBuilder):
         self._vector_column = field_dict[name]
         return self
 
-    def with_query_vector(self, vector):
-        # type: (list) -> VectorSearchBuilder
-        self._query_vector = vector
+    def with_option(self, key, value):
+        # type: (str, str) -> VectorSearchBuilder
+        self._options[key] = value
+        return self
+
+    def with_options(self, options):
+        # type: (dict) -> VectorSearchBuilder
+        if options is not None:
+            self._options.update(options)
         return self
 
     def with_filter(self, predicate):
@@ -197,7 +216,21 @@ class VectorSearchBuilderImpl(VectorSearchBuilder):
             self._vector_column,
             filter_=self._filter,
             partition_filter=self._partition_filter,
+            options=self._options,
         )
+
+
+class VectorSearchBuilderImpl(AbstractVectorSearchBuilderImpl, VectorSearchBuilder):
+    """Implementation for VectorSearchBuilder."""
+
+    def __init__(self, table):
+        super().__init__(table)
+        self._query_vector = None
+
+    def with_query_vector(self, vector):
+        # type: (list) -> VectorSearchBuilder
+        self._query_vector = vector
+        return self
 
     def new_vector_search_read(self):
         # type: () -> VectorSearchRead
@@ -213,4 +246,6 @@ class VectorSearchBuilderImpl(VectorSearchBuilder):
             self._vector_column,
             self._query_vector,
             filter_=self._filter,
+            partition_filter=self._partition_filter,
+            options=self._options,
         )

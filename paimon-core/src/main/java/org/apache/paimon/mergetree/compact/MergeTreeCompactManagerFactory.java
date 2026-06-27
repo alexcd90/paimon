@@ -147,12 +147,13 @@ public class MergeTreeCompactManagerFactory implements KvCompactionManagerFactor
             int bucket,
             ExecutorService compactExecutor,
             List<DataFileMeta> restoreFiles,
-            @Nullable BucketedDvMaintainer dvMaintainer) {
+            @Nullable BucketedDvMaintainer dvMaintainer,
+            boolean ignorePreviousFiles) {
         if (options.writeOnly()) {
             return new NoopCompactManager();
         }
 
-        CompactStrategy compactStrategy = createCompactStrategy(options);
+        CompactStrategy compactStrategy = createCompactStrategy(options, restoreFiles);
         Comparator<InternalRow> keyComparator = keyComparatorSupplier.get();
         Levels levels = new Levels(keyComparator, restoreFiles, options.numLevels());
         @Nullable FieldsComparator userDefinedSeqComparator = udsComparatorSupplier.get();
@@ -163,7 +164,8 @@ public class MergeTreeCompactManagerFactory implements KvCompactionManagerFactor
                         keyComparator,
                         userDefinedSeqComparator,
                         levels,
-                        dvMaintainer);
+                        dvMaintainer,
+                        ignorePreviousFiles);
         CompactionMetrics.Reporter metricsReporter =
                 compactionMetrics == null
                         ? null
@@ -188,7 +190,10 @@ public class MergeTreeCompactManagerFactory implements KvCompactionManagerFactor
                 options.isChainTable());
     }
 
-    private CompactStrategy createCompactStrategy(CoreOptions options) {
+    private CompactStrategy createCompactStrategy(
+            CoreOptions options, List<DataFileMeta> restoreFiles) {
+        Long initialLastFullCompaction =
+                estimateLastFullCompactionTime(restoreFiles, options.numLevels());
         if (options.needLookup()) {
             Integer compactMaxInterval = null;
             switch (options.lookupCompact()) {
@@ -203,7 +208,7 @@ public class MergeTreeCompactManagerFactory implements KvCompactionManagerFactor
                             options.maxSizeAmplificationPercent(),
                             options.sortedRunSizeRatio(),
                             options.numSortedRunCompactionTrigger(),
-                            EarlyFullCompaction.create(options),
+                            EarlyFullCompaction.create(options, initialLastFullCompaction),
                             OffPeakHours.create(options)),
                     compactMaxInterval);
         }
@@ -213,7 +218,7 @@ public class MergeTreeCompactManagerFactory implements KvCompactionManagerFactor
                         options.maxSizeAmplificationPercent(),
                         options.sortedRunSizeRatio(),
                         options.numSortedRunCompactionTrigger(),
-                        EarlyFullCompaction.create(options),
+                        EarlyFullCompaction.create(options, initialLastFullCompaction),
                         OffPeakHours.create(options));
         if (options.compactionForceUpLevel0()) {
             return new ForceUpLevel0Compaction(universal, null);
@@ -222,13 +227,30 @@ public class MergeTreeCompactManagerFactory implements KvCompactionManagerFactor
         }
     }
 
+    @Nullable
+    private static Long estimateLastFullCompactionTime(
+            List<DataFileMeta> restoreFiles, int numLevels) {
+        int maxLevel = numLevels - 1;
+        long max = -1;
+        for (DataFileMeta f : restoreFiles) {
+            if (f.level() == maxLevel) {
+                long t = f.creationTimeEpochMillis();
+                if (t > max) {
+                    max = t;
+                }
+            }
+        }
+        return max < 0 ? null : max;
+    }
+
     private MergeTreeCompactRewriter createRewriter(
             BinaryRow partition,
             int bucket,
             Comparator<InternalRow> keyComparator,
             @Nullable FieldsComparator userDefinedSeqComparator,
             Levels levels,
-            @Nullable BucketedDvMaintainer dvMaintainer) {
+            @Nullable BucketedDvMaintainer dvMaintainer,
+            boolean ignorePreviousFiles) {
         DeletionVector.Factory dvFactory = DeletionVector.factory(dvMaintainer);
         KeyValueFileReaderFactory keyReaderFactory =
                 readerFactoryBuilder.build(partition, bucket, dvFactory);
@@ -312,7 +334,7 @@ public class MergeTreeCompactManagerFactory implements KvCompactionManagerFactor
                     mfFactory,
                     mergeSorter,
                     wrapperFactory,
-                    lookupStrategy.produceChangelog,
+                    lookupStrategy.produceChangelog && !ignorePreviousFiles,
                     dvMaintainer,
                     options,
                     remoteLookupFileManager);

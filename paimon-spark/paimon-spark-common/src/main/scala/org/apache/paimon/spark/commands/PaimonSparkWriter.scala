@@ -305,6 +305,7 @@ case class PaimonSparkWriter(
         }
         val clusteringColumns = coreOptions.clusteringColumns()
         if (
+          table.bucketMode() != POSTPONE_MODE &&
           (!coreOptions.clusteringIncrementalEnabled() || coreOptions
             .clusteringIncrementalOptimizeWrite()) && (!clusteringColumns.isEmpty)
         ) {
@@ -315,7 +316,7 @@ case class PaimonSparkWriter(
         writeWithoutBucket(input)
 
       case HASH_FIXED =>
-        if (paimonExtensionEnabled && BucketFunction.supportsTable(table)) {
+        if (paimonExtensionEnabled(sparkSession) && BucketFunction.supportsTable(table)) {
           // Topology: input -> shuffle by partition & bucket
           val bucketNumber = coreOptions.bucket()
           val bucketKeyCol = tableSchema
@@ -413,6 +414,10 @@ case class PaimonSparkWriter(
   }
 
   def commit(commitMessages: Seq[CommitMessage]): Unit = {
+    commit(commitMessages, null)
+  }
+
+  def commit(commitMessages: Seq[CommitMessage], operation: Snapshot.Operation): Unit = {
     val finalWriteBuilder = if (postponeBatchWriteFixedBucket) {
       writeBuilder
         .asInstanceOf[BatchWriteBuilderImpl]
@@ -423,6 +428,9 @@ case class PaimonSparkWriter(
       writeBuilder
     }
     val tableCommit = finalWriteBuilder.newCommit()
+    if (operation != null) {
+      tableCommit.withOperation(operation)
+    }
     try {
       tableCommit.commit(commitMessages.toList.asJava)
     } catch {
@@ -433,7 +441,7 @@ case class PaimonSparkWriter(
     postCommit(commitMessages)
   }
 
-  /** Boostrap and repartition for cross partition mode. */
+  /** Bootstrap and repartition for cross partition mode. */
   private def bootstrapAndRepartitionByKeyHash(
       data: DataFrame,
       parallelism: Int,

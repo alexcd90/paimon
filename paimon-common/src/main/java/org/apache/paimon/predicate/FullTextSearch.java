@@ -18,55 +18,52 @@
 
 package org.apache.paimon.predicate;
 
-import org.apache.paimon.globalindex.GlobalIndexReader;
-import org.apache.paimon.globalindex.ScoredGlobalIndexResult;
-
 import java.io.Serializable;
-import java.util.Optional;
+import java.util.List;
 
-/** FullTextSearch to perform full-text search on a text column. */
+/** FullTextSearch to perform full-text search with a structured query. */
 public class FullTextSearch implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    private final String queryText;
-    private final String fieldName;
+    private final FullTextQuery query;
     private final int limit;
 
-    public FullTextSearch(String queryText, int limit, String fieldName) {
-        if (queryText == null || queryText.isEmpty()) {
-            throw new IllegalArgumentException("Query text cannot be null or empty");
+    public FullTextSearch(FullTextQuery query, int limit) {
+        if (query == null) {
+            throw new IllegalArgumentException("Query cannot be null");
         }
         if (limit <= 0) {
             throw new IllegalArgumentException("Limit must be positive, got: " + limit);
         }
-        if (fieldName == null || fieldName.isEmpty()) {
-            throw new IllegalArgumentException("Field name cannot be null or empty");
-        }
-        this.queryText = queryText;
+        this.query = query;
         this.limit = limit;
-        this.fieldName = fieldName;
-    }
-
-    public String queryText() {
-        return queryText;
     }
 
     public int limit() {
         return limit;
     }
 
-    public String fieldName() {
-        return fieldName;
+    public List<String> columns() {
+        return query.columns();
     }
 
-    public Optional<ScoredGlobalIndexResult> visit(GlobalIndexReader visitor) {
-        return visitor.visitFullTextSearch(this);
+    public String fieldName() {
+        return query.singleColumn();
+    }
+
+    public FullTextQuery query() {
+        return query;
+    }
+
+    public String queryJson() {
+        return query.toJson();
     }
 
     @Override
     public String toString() {
         return String.format(
-                "FullTextSearch{field=%s, query='%s', limit=%d}", fieldName, queryText, limit);
+                "FullTextSearch{columns=%s, limit=%d, queryJson=%s}",
+                columns(), limit, queryJson());
     }
 }

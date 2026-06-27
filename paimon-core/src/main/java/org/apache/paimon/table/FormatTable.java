@@ -31,7 +31,9 @@ import org.apache.paimon.table.format.FormatBatchWriteBuilder;
 import org.apache.paimon.table.format.FormatReadBuilder;
 import org.apache.paimon.table.sink.BatchWriteBuilder;
 import org.apache.paimon.table.sink.StreamWriteBuilder;
+import org.apache.paimon.table.source.BatchVectorSearchBuilder;
 import org.apache.paimon.table.source.FullTextSearchBuilder;
+import org.apache.paimon.table.source.HybridSearchBuilder;
 import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.table.source.VectorSearchBuilder;
 import org.apache.paimon.types.RowType;
@@ -79,7 +81,8 @@ public interface FormatTable extends Table {
         PARQUET,
         CSV,
         TEXT,
-        JSON
+        JSON,
+        MOSAIC
     }
 
     /** Parses a file format string to a corresponding {@link Format} enum constant. */
@@ -280,6 +283,16 @@ public interface FormatTable extends Table {
         }
 
         @Override
+        public HybridSearchBuilder newHybridSearchBuilder() {
+            throw new UnsupportedOperationException("FormatTable does not support hybrid search.");
+        }
+
+        @Override
+        public BatchVectorSearchBuilder newBatchVectorSearchBuilder() {
+            throw new UnsupportedOperationException("FormatTable does not support vector search.");
+        }
+
+        @Override
         public FullTextSearchBuilder newFullTextSearchBuilder() {
             throw new UnsupportedOperationException(
                     "FormatTable does not support full-text search.");
@@ -424,6 +437,11 @@ public interface FormatTable extends Table {
 
     @Override
     default void fastForward(String branchName) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    default void mergeBranch(String sourceBranch, String targetBranch) {
         throw new UnsupportedOperationException();
     }
 

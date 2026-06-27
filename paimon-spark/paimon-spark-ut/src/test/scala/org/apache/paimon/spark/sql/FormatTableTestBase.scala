@@ -35,6 +35,8 @@ import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 
 abstract class FormatTableTestBase extends PaimonHiveTestBase with AdaptiveSparkPlanHelper {
 
+  import testImplicits._
+
   override protected def beforeEach(): Unit = {
     sql(s"USE $paimonHiveCatalogName")
     sql(s"USE $hiveDbName")
@@ -158,6 +160,48 @@ abstract class FormatTableTestBase extends PaimonHiveTestBase with AdaptiveSpark
     }
   }
 
+  test("Format table: create or replace as select supports table type change") {
+    assume(gteqSpark3_4)
+    withTable("t") {
+      sql("""
+            |CREATE TABLE t (id BIGINT, data STRING)
+            |USING paimon
+            |TBLPROPERTIES ('primary-key' = 'id', 'bucket' = '2')
+            |""".stripMargin)
+      sql("INSERT INTO t VALUES (1, 'old')")
+      Seq((2L, "new")).toDF("id", "data").createOrReplaceTempView("source")
+
+      sql("""
+            |CREATE OR REPLACE TABLE t
+            |USING csv
+            |AS SELECT * FROM source
+            |""".stripMargin)
+
+      assert(paimonCatalog.getTable(Identifier.create(hiveDbName, "t")).isInstanceOf[FormatTable])
+      checkAnswer(sql("SELECT * FROM t"), Seq(Row(2L, "new")))
+    }
+  }
+
+  test("Format table: replace table supports table type change") {
+    assume(gteqSpark3_4)
+    withTable("t") {
+      sql("""
+            |CREATE TABLE t (id BIGINT, data STRING)
+            |USING paimon
+            |TBLPROPERTIES ('primary-key' = 'id', 'bucket' = '2')
+            |""".stripMargin)
+      sql("INSERT INTO t VALUES (1, 'old')")
+
+      sql("""
+            |REPLACE TABLE t (id BIGINT, data STRING)
+            |USING csv
+            |""".stripMargin)
+
+      assert(paimonCatalog.getTable(Identifier.create(hiveDbName, "t")).isInstanceOf[FormatTable])
+      checkAnswer(sql("SELECT * FROM t"), Seq.empty[Row])
+    }
+  }
+
   test("Format table: read compressed files") {
     for (format <- Seq("csv", "json")) {
       withTable("compress_t") {
@@ -198,6 +242,17 @@ abstract class FormatTableTestBase extends PaimonHiveTestBase with AdaptiveSpark
       sql("INSERT INTO t2 VALUES (1, 1)")
       val df = sql("SELECT t1.f0, t1.f1, t2.f2 FROM t1, t2 WHERE t1.f0 = t2.f0")
       assert(df.queryExecution.executedPlan.toString().contains("BroadcastExchange"))
+    }
+  }
+
+  test("Format table: csv with empty quote-character should fail") {
+    withTable("t") {
+      withSparkSQLConf("spark.paimon.format-table.implementation" -> "paimon") {
+        val error = intercept[IllegalArgumentException] {
+          sql("CREATE TABLE t (f0 INT, f1 STRING) USING CSV OPTIONS ('csv.quote-character' '')")
+        }
+        assert(error.getMessage.contains("csv.quote-character must not be empty"))
+      }
     }
   }
 
@@ -381,6 +436,46 @@ abstract class FormatTableTestBase extends PaimonHiveTestBase with AdaptiveSpark
       )
 
       val filteredSplits = collectFilteredInputSplits(df.queryExecution.executedPlan, "fact_table")
+      assert(filteredSplits.size == 2)
+    }
+  }
+
+  test("Paimon format table: runtime filter combined with pushed-down partition filter") {
+    withTable("dwd_fact", "dim_date") {
+      sql("""
+            |CREATE TABLE dwd_fact (id INT, amount DOUBLE, dt STRING, hour STRING)
+            |USING PARQUET
+            |TBLPROPERTIES ('format-table.implementation'='paimon')
+            |PARTITIONED BY (dt, hour)
+            |""".stripMargin)
+      sql("""
+            |CREATE TABLE dim_date (dt STRING, name STRING)
+            |USING PARQUET
+            |TBLPROPERTIES ('format-table.implementation'='paimon')
+            |""".stripMargin)
+
+      sql("""
+            |INSERT INTO dwd_fact VALUES
+            |(1, 10.0, '20260622', '00'),
+            |(2, 20.0, '20260622', '01'),
+            |(3, 30.0, '20260621', '00'),
+            |(4, 40.0, '20260620', '23')
+            |""".stripMargin)
+      sql("INSERT INTO dim_date VALUES ('20260622', 'today')")
+
+      val df = sql("""
+                     |SELECT f.id, f.dt, f.hour, d.name
+                     |FROM dwd_fact f
+                     |JOIN dim_date d ON f.dt = d.dt
+                     |WHERE f.dt >= '20260620'
+                     |ORDER BY f.id
+                     |""".stripMargin)
+
+      checkAnswer(df, Seq(Row(1, "20260622", "00", "today"), Row(2, "20260622", "01", "today")))
+
+      // Static pushdown (dt >= '20260620') alone keeps all 4 partitions; the runtime filter on dt
+      // prunes the scan down to the two partitions of dt='20260622'.
+      val filteredSplits = collectFilteredInputSplits(df.queryExecution.executedPlan, "dwd_fact")
       assert(filteredSplits.size == 2)
     }
   }
